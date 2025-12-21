@@ -7,8 +7,10 @@ from faiss_store import search as faiss_search
 from db import get_chunks_by_vector_ids
 from pathlib import Path
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import httpx
 import faiss
+import json
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5-coder:14b"
@@ -35,6 +37,10 @@ class AskRequest(BaseModel):
     top_k: int = 6
     task: str | None = None     # qa | summary | None (auto-infer)
 
+class RememberRequest(BaseModel):
+    content: str
+    source: str = "manual"
+
 def infer_task(question: str) -> str:
     q = question.lower()
     summary_keywords = ["summarize", "summary", "overview", "bullet", "bullets", "tl;dr", "high level"]
@@ -53,6 +59,32 @@ def should_fallback_to_general(vector_ids: list[int], scores: list[float]) -> bo
     best = scores[0] if scores else 0.0
     return best < 0.38  # adjust if needed (0.33-0.45 typical)
 
+async def ollama_stream(prompt: str, model: str):
+    """
+    Yields text chunks from Ollama as they arrive (NDJSON stream).
+    """
+    payload = {"model": model, "prompt": prompt, "stream": True}
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream("POST", f"{OLLAMA_BASE_URL}/api/generate", json=payload) as r:
+            r.raise_for_status()
+
+            async for line in r.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Ollama streams partial text in `response`
+                chunk = obj.get("response", "")
+                if chunk:
+                    yield chunk
+
+                if obj.get("done"):
+                    break
+
 async def ollama_generate(prompt: str, model: str) -> str:
     payload = {"model": model, "prompt": prompt, "stream": False}
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -70,13 +102,67 @@ def load_faiss_index():
         idx = faiss.IndexIDMap2(idx)
     return idx
 
+async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -> tuple[str | None, list, dict]:
+    q_vec = (await embed_texts([question]))[0]
+
+    index = load_faiss_index()
+    if index is None:
+        return None, [], {"top_k": top_k, "best_score": 0.0}
+
+    k = top_k
+    if task == "summary":
+        k = max(k, 12)
+
+    scores, vector_ids = faiss_search(index, q_vec, top_k=k)
+    chunks = get_chunks_by_vector_ids(vector_ids)
+
+    if not chunks:
+        return None, [], {"top_k": k, "best_score": float(scores[0]) if scores else 0.0}
+
+    context_blocks = []
+    sources = []
+    for i, ch in enumerate(chunks):
+        label = f"S{i+1}"
+        context_blocks.append(
+            f"[{label}] doc={ch['doc_path']} chunk={ch['chunk_index']}\n{ch['text']}"
+        )
+        src_score = scores[i] if i < len(scores) else None
+        sources.append({
+            "label": label,
+            "doc_path": ch["doc_path"],
+            "chunk_index": ch["chunk_index"],
+            "score": float(src_score) if src_score is not None else None,
+        })
+
+    if task == "summary":
+        instructions = (
+            "TASK: Summarize using ONLY the provided SOURCES.\n"
+            "You MUST synthesize a summary even if the sources are split across chunks.\n"
+            "Do NOT say 'I don't know' just because a summary isn't explicitly written.\n"
+            "If important sections are missing, make a partial summary and say what seems missing.\n"
+            "Follow the user's format request (e.g. bullet points).\n"
+            "Cite sources inline like [S1], [S2].\n"
+        )
+    else:
+        instructions = (
+            "TASK: Answer using ONLY the provided SOURCES.\n"
+            "If the answer cannot be found in the sources, say 'I don't know'.\n"
+            "Cite sources inline like [S1], [S2].\n"
+        )
+
+    prompt = (
+        "You are a local, privacy-first assistant.\n\n"
+        f"QUESTION:\n{question}\n\n"
+        "SOURCES:\n" + "\n\n".join(context_blocks) + "\n\n"
+        f"{instructions}"
+    )
+
+    return prompt, sources, {"top_k": k, "best_score": float(scores[0]) if scores else 0.0}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-class RememberRequest(BaseModel):
-    content: str
-    source: str = "manual"
 
 @app.post("/remember")
 def remember(req: RememberRequest):
@@ -179,12 +265,18 @@ async def ask(req: AskRequest):
                 "Cite sources inline like [S1], [S2].\n"
             )
 
-        prompt = (
-            "You are a local, privacy-first assistant.\n\n"
-            f"QUESTION:\n{req.question}\n\n"
-            "SOURCES:\n" + "\n\n".join(context_blocks) + "\n\n"
-            f"{instructions}"
-        )
+        prompt, sources, retrieval = await build_local_prompt_and_sources(req.question, task, req.top_k)
+
+        if prompt is None:
+            return {
+                "answer": "I couldn't find anything relevant in your local documents.",
+                "mode": "local",
+                "task": task,
+                "sources": [],
+                "used_tools": ["ollama", "faiss", "sqlite"],
+                "model": model,
+                "retrieval": retrieval,
+            }
 
         try:
             answer = await ollama_generate(prompt, model)
@@ -200,8 +292,7 @@ async def ask(req: AskRequest):
             "sources": sources,
             "used_tools": ["ollama", "faiss", "sqlite"],
             "model": model,
-            # handy for debugging
-            "retrieval": {"top_k": k, "best_score": float(scores[0]) if scores else 0.0},
+            "retrieval": retrieval,
         }
 
     # ---------- ROUTING ----------
@@ -241,4 +332,71 @@ async def ask(req: AskRequest):
         return local_result
 
     raise HTTPException(status_code=400, detail="Unsupported mode. Use 'auto', 'local', or 'general'.")
+
+@app.post("/ask/stream")
+async def ask_stream(req: AskRequest):
+    model = req.model or DEFAULT_MODEL
+    task = req.task or infer_task(req.question)
+    mode = (req.mode or "auto").lower().strip()
+
+    async def sse():
+        # Decide route + build prompt (without generating yet)
+        final_mode = mode
+        sources = []
+        retrieval = {}
+
+        if mode == "general":
+            prompt = req.question
+
+        elif mode == "local":
+            prompt, sources, retrieval = await build_local_prompt_and_sources(req.question, task, req.top_k)
+            if prompt is None:
+                meta = {"mode": "local", "task": task, "sources": [], "model": model, "retrieval": retrieval}
+                yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+                yield f"data: I couldn't find anything relevant in your local documents.\n\n"
+                yield "event: done\ndata: {}\n\n"
+                return
+
+        elif mode == "auto":
+            prompt_local, sources_local, retrieval_local = await build_local_prompt_and_sources(req.question, task, req.top_k)
+
+            # fallback decision (same heuristic as non-stream)
+            if prompt_local is None or should_fallback_to_general(
+                vector_ids=[1] if sources_local else [],
+                scores=[float(retrieval_local.get("best_score", 0.0))] if sources_local else [],
+            ):
+                final_mode = "auto->general"
+                prompt = req.question
+                sources = []
+                retrieval = {}
+            else:
+                final_mode = "auto->local"
+                prompt = prompt_local
+                sources = sources_local
+                retrieval = retrieval_local
+        else:
+            meta = {"mode": "error", "task": task, "sources": [], "model": model}
+            yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+            yield f"data: Unsupported mode. Use 'auto', 'local', or 'general'.\n\n"
+            yield "event: done\ndata: {}\n\n"
+            return
+
+        # Send meta first (frontend uses this to set sources/mode/task)
+        meta = {"mode": final_mode, "task": task, "sources": sources, "model": model, "retrieval": retrieval}
+        yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+
+        # Stream tokens
+        try:
+            async for chunk in ollama_stream(prompt, model):
+                # SSE message
+                yield f"data: {chunk}\n\n"
+        except httpx.ConnectError:
+            yield f"data: Cannot connect to Ollama. Is `ollama serve` running?\n\n"
+        except Exception as e:
+            yield f"data: Error: {str(e)}\n\n"
+
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(sse(), media_type="text/event-stream")
+
 

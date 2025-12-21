@@ -61,6 +61,7 @@ export default function Page() {
 
   const canAsk = useMemo(() => question.trim().length > 0 && !loading, [question, loading]);
 
+
   async function ask() {
     const q = question.trim();
     if (!q || loading) return;
@@ -88,28 +89,105 @@ export default function Page() {
     setQuestion("");
 
     try {
-      const res = await fetch("http://localhost:8000/ask", {
+      const res = await fetch("http://localhost:8000/ask/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
         body: JSON.stringify({ question: q, mode, top_k: 10 }),
       });
 
-      const data: AskResponse = await res.json();
+      if (!res.ok || !res.body) {
+        throw new Error(`Streaming failed: ${res.status}`);
+      }
 
+      // Start assistant message as empty (instead of "Thinking…")
       setMessages((prev) =>
         prev.map((m) =>
-          m.id === assistantId
-            ? {
-              ...m,
-              content: data.answer || "(no answer)",
-              sources: data.sources || [],
-              mode: data.mode,
-              task: data.task,
-              model: data.model,
-            }
-            : m
+          m.id === assistantId ? { ...m, content: "" } : m
         )
       );
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+
+      let buffer = "";
+      let metaApplied = false;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE frames are separated by a blank line
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() || "";
+
+        for (const frame of frames) {
+          const lines = frame.split("\n").filter(Boolean);
+
+          let eventName = "message";
+          const dataLines: string[] = [];
+
+          for (const line of lines) {
+            if (line.startsWith("event:")) {
+              eventName = line.slice("event:".length).trim();
+            } else if (line.startsWith("data:")) {
+              // keep exact spacing from server
+              dataLines.push(line.slice("data:".length));
+            }
+          }
+
+          const data = dataLines.join("\n");
+
+          if (eventName === "meta") {
+            // meta contains mode/task/sources/model/retrieval
+            try {
+              const meta = JSON.parse(data);
+
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId
+                    ? {
+                      ...m,
+                      mode: meta.mode,
+                      task: meta.task,
+                      model: meta.model,
+                      sources: meta.sources || [],
+                    }
+                    : m
+                )
+              );
+
+              metaApplied = true;
+            } catch {
+              // ignore bad meta
+            }
+            continue;
+          }
+
+          if (eventName === "done") {
+            continue;
+          }
+
+          // default "message": append token chunk
+          // If the backend sends leading spaces, preserve them
+          const chunk = data;
+
+          // Optional: if for some reason meta isn't sent, still stream text
+          if (!metaApplied) metaApplied = true;
+
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? { ...m, content: (m.content || "") + chunk }
+                : m
+            )
+          );
+        }
+      }
     } catch {
       const msg = "Could not reach backend. Is FastAPI running on http://localhost:8000 ?";
       setError(msg);
@@ -127,6 +205,7 @@ export default function Page() {
     } finally {
       setLoading(false);
     }
+
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -354,7 +433,7 @@ export default function Page() {
                   <span className="absolute inset-0 bg-linear-to-r from-cyan-600 via-cyan-500 to-emerald-400 opacity-90" />
                 )}
                 <span className={cx("relative", canAsk ? "drop-shadow" : "")}>
-                  {loading ? "Thinking…" : "Ask"}
+                  {loading ? "Generating…" : "Ask"}
                 </span>
               </button>
             </div>
