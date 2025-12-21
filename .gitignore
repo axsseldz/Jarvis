@@ -1,4 +1,6 @@
 backend/.localAiEenv/
 backend/__pycache__/
 backend/memory.db
+backend/data/
+backend/vector_index/
 .vscode/

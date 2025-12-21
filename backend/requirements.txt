@@ -2,3 +2,5 @@ fastapi
 uvicorn
 pydantic
 httpx
+faiss-cpu 
+pymupdf

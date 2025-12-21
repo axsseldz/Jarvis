@@ -1,4 +1,5 @@
 import sqlite3
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
@@ -14,6 +15,28 @@ CREATE TABLE IF NOT EXISTS episodic_memory (
 
 CREATE INDEX IF NOT EXISTS idx_episodic_created_at ON episodic_memory(created_at);
 CREATE INDEX IF NOT EXISTS idx_episodic_content ON episodic_memory(content);
+
+-- Documents that have been indexed
+CREATE TABLE IF NOT EXISTS documents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path TEXT NOT NULL UNIQUE,
+  file_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active', -- active | deleted
+  indexed_at TEXT NOT NULL
+);
+
+-- Chunks belonging to a document (each chunk corresponds to one FAISS vector)
+CREATE TABLE IF NOT EXISTS chunks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_id INTEGER NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  vector_id INTEGER NOT NULL UNIQUE,
+  FOREIGN KEY(doc_id) REFERENCES documents(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
+CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id);
 """
 
 def get_conn() -> sqlite3.Connection:
@@ -43,3 +66,75 @@ def search_memory(query: str, limit: int = 10):
             (like, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+    
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+def upsert_document(path_str: str, file_hash: str) -> int:
+    now = datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        row = conn.execute("SELECT id, file_hash, status FROM documents WHERE path = ?", (path_str,)).fetchone()
+        if row is None:
+            cur = conn.execute(
+                "INSERT INTO documents(path, file_hash, status, indexed_at) VALUES (?, ?, 'active', ?)",
+                (path_str, file_hash, now),
+            )
+            return int(cur.lastrowid)
+
+        # If doc existed, update hash/status/indexed_at
+        conn.execute(
+            "UPDATE documents SET file_hash=?, status='active', indexed_at=? WHERE id=?",
+            (file_hash, now, int(row["id"])),
+        )
+        return int(row["id"])
+
+def get_document_by_path(path_str: str):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM documents WHERE path = ?", (path_str,)).fetchone()
+        return dict(row) if row else None
+
+def list_active_document_paths() -> list[str]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT path FROM documents WHERE status='active'").fetchall()
+        return [r["path"] for r in rows]
+
+def mark_document_deleted(path_str: str) -> list[int]:
+    """
+    Mark doc as deleted and return vector_ids belonging to it (so FAISS can remove them).
+    """
+    with get_conn() as conn:
+        doc = conn.execute("SELECT id FROM documents WHERE path = ?", (path_str,)).fetchone()
+        if not doc:
+            return []
+        doc_id = int(doc["id"])
+        vec_rows = conn.execute("SELECT vector_id FROM chunks WHERE doc_id = ?", (doc_id,)).fetchall()
+        vector_ids = [int(r["vector_id"]) for r in vec_rows]
+
+        conn.execute("UPDATE documents SET status='deleted' WHERE id = ?", (doc_id,))
+        conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))  # keep DB clean in strict sync
+        return vector_ids
+
+def chunk_exists_for_doc(doc_id: int, file_hash: str) -> bool:
+    """
+    Not used directly; we skip reindexing via hash check at document level.
+    """
+    return False
+
+def get_doc_hash_and_status(path_str: str):
+    with get_conn() as conn:
+        row = conn.execute("SELECT file_hash, status FROM documents WHERE path = ?", (path_str,)).fetchone()
+        if not row:
+            return None
+        return {"file_hash": row["file_hash"], "status": row["status"]}
+
+def insert_chunks(doc_id: int, chunks: list[str], vector_ids: list[int]) -> None:
+    with get_conn() as conn:
+        for i, (txt, vid) in enumerate(zip(chunks, vector_ids)):
+            conn.execute(
+                "INSERT INTO chunks(doc_id, chunk_index, text, vector_id) VALUES (?, ?, ?, ?)",
+                (doc_id, i, txt, int(vid)),
+            )
