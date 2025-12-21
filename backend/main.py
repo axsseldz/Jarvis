@@ -1,11 +1,18 @@
+from contextlib import asynccontextmanager
+from db import init_db, add_memory, search_memory
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 
-app = FastAPI(title="Local AI Backend")
-
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5-coder:14b"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(title="Local AI Backend", lifespan=lifespan)
 
 class AskRequest(BaseModel):
     question: str
@@ -15,6 +22,19 @@ class AskRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+class RememberRequest(BaseModel):
+    content: str
+    source: str = "manual"
+
+@app.post("/remember")
+def remember(req: RememberRequest):
+    mem_id = add_memory(req.content, req.source)
+    return {"ok": True, "id": mem_id}
+
+@app.get("/memory/search")
+def memory_search(q: str, limit: int = 10):
+    return {"results": search_memory(q, limit)}
 
 @app.post("/ask")
 async def ask(req: AskRequest):
