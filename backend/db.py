@@ -138,3 +138,27 @@ def insert_chunks(doc_id: int, chunks: list[str], vector_ids: list[int]) -> None
                 "INSERT INTO chunks(doc_id, chunk_index, text, vector_id) VALUES (?, ?, ?, ?)",
                 (doc_id, i, txt, int(vid)),
             )
+
+def get_chunks_by_vector_ids(vector_ids: list[int]) -> list[dict]:
+    if not vector_ids:
+        return []
+
+    order = {vid: i for i, vid in enumerate(vector_ids)}
+
+    placeholders = ",".join(["?"] * len(vector_ids))
+    sql = f"""
+    SELECT
+      c.vector_id,
+      c.chunk_index,
+      c.text,
+      d.path AS doc_path
+    FROM chunks c
+    JOIN documents d ON d.id = c.doc_id
+    WHERE c.vector_id IN ({placeholders})
+    """
+
+    with get_conn() as conn:
+        rows = conn.execute(sql, vector_ids).fetchall()
+        items = [dict(r) for r in rows]
+        items.sort(key=lambda x: order.get(int(x["vector_id"]), 10**9))
+        return items
