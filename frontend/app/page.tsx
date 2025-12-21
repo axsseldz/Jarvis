@@ -52,6 +52,13 @@ type IndexStatus = {
   } | null;
 };
 
+type DocItem = {
+  name: string;
+  path: string;
+  size: number;
+  modified_at: string;
+};
+
 function cx(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
 }
@@ -68,6 +75,10 @@ export default function Page() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [indexStarting, setIndexStarting] = useState(false);
+  const [docs, setDocs] = useState<DocItem[]>([]);
+  const [selectedDoc, setSelectedDoc] = useState<string>(""); // filename
+  const [uploading, setUploading] = useState(false);
+
 
   const chatRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -249,6 +260,40 @@ export default function Page() {
 
   }
 
+  async function fetchDocs() {
+    try {
+      const r = await fetch("http://localhost:8000/docs/list");
+      const data = await r.json();
+      setDocs(data.docs || []);
+      if (!selectedDoc && data.docs?.length) {
+        setSelectedDoc(data.docs[0].name);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function uploadDoc(file: File) {
+    try {
+      setUploading(true);
+      const fd = new FormData();
+      fd.append("file", file);
+
+      const r = await fetch("http://localhost:8000/docs/upload", {
+        method: "POST",
+        body: fd,
+      });
+
+      if (!r.ok) throw new Error("upload failed");
+
+      // refresh docs + index status soon
+      await fetchDocs();
+      setTimeout(fetchIndexStatus, 400);
+    } finally {
+      setUploading(false);
+    }
+  }
+
   async function fetchIndexStatus() {
     try {
       const r = await fetch("http://localhost:8000/index/status");
@@ -282,6 +327,24 @@ export default function Page() {
     setMessages([]);
     setError("");
   }
+
+  useEffect(() => {
+    fetchDocs();
+  }, []);
+
+  // Refresh docs list when indexing finishes successfully
+  useEffect(() => {
+    if (indexStatus?.state === "ok" && !indexStatus?.is_indexing) {
+      fetchDocs();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [indexStatus?.last_finished_at]);
+
+  const controlButtonBase =
+    "relative overflow-hidden rounded-xl border px-3 py-1.5 text-xs font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-[1px]";
+  const controlButtonActive =
+    "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-cyan-400/60 hover:bg-cyan-500/10 hover:shadow-[0_12px_45px_rgba(34,211,238,0.18)] active:scale-[0.98] active:border-cyan-300/70 active:bg-cyan-500/15 cursor-pointer";
+  const controlButtonDisabled = "border-slate-800/70 bg-slate-950/30 text-slate-500 cursor-not-allowed shadow-none";
 
   return (
     <div
@@ -333,6 +396,17 @@ export default function Page() {
           className="mx-auto w-full max-w-5xl rounded-3xl border border-slate-800/60 bg-linear-to-r from-[#0f1823] via-[#0f1f2b] to-[#0b111a] p-4 mt-4 flex-1 min-h-80 min-w-0 overflow-y-auto scroll-smooth shadow-[0_18px_80px_rgba(0,0,0,0.35)] backdrop-blur-xl"
           ref={chatRef}
           style={{ scrollbarGutter: "stable" }}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const f = e.dataTransfer.files?.[0];
+            if (f) uploadDoc(f);
+          }}
+          title="Drag & drop a file here to upload + index"
         >
           <div className="space-y-3">
             <AnimatePresence>
@@ -464,6 +538,52 @@ export default function Page() {
               </div>
 
               <div className="flex items-center gap-2">
+                {/* Docs dropdown */}
+                <div className="relative">
+                  <select
+                    className="select-modern appearance-none rounded-xl border border-slate-800/70 bg-linear-to-r from-[#0f1823] via-[#0f1c28] to-[#0b1420] px-3 py-1.5 pr-8 text-xs font-semibold text-slate-200 shadow-sm focus:outline-none focus:ring-0 focus:border-cyan-500/40 hover:border-cyan-400/50 transition"
+                    value={selectedDoc}
+                    onChange={(e) => setSelectedDoc(e.target.value)}
+                    title="Documents in data/documents"
+                  >
+                    {docs.length === 0 ? (
+                      <option className="bg-[#0f1620] text-slate-100" value="">
+                        No docs
+                      </option>
+                    ) : (
+                      docs.map((d) => (
+                        <option key={d.name} className="bg-[#0f1620] text-slate-100" value={d.name}>
+                          {d.name}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-cyan-200">
+                    ▾
+                  </span>
+                </div>
+
+                {/* Upload (file picker) */}
+                <label
+                  className={cx(
+                    controlButtonBase,
+                    uploading ? controlButtonDisabled : controlButtonActive
+                  )}
+                  title="Upload a document into data/documents and auto-index"
+                >
+                  {uploading ? "Uploading…" : "Upload"}
+                  <input
+                    type="file"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) uploadDoc(f);
+                      e.currentTarget.value = "";
+                    }}
+                    disabled={uploading}
+                  />
+                </label>
+
                 {/* Index status pill */}
                 <div
                   className={cx(
@@ -489,10 +609,8 @@ export default function Page() {
                   onClick={startIndexNow}
                   disabled={!!indexStatus?.is_indexing || indexStarting}
                   className={cx(
-                    "rounded-xl border px-3 py-1.5 text-xs font-semibold transition",
-                    indexStatus?.is_indexing || indexStarting
-                      ? "border-slate-800/70 bg-slate-950/30 text-slate-500 cursor-not-allowed"
-                      : "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:bg-slate-950/70"
+                    controlButtonBase,
+                    indexStatus?.is_indexing || indexStarting ? controlButtonDisabled : controlButtonActive
                   )}
                   title="Run indexing now"
                 >
@@ -502,7 +620,7 @@ export default function Page() {
                 {/* Clear */}
                 <button
                   onClick={clearChat}
-                  className="rounded-xl border border-slate-800/70 bg-slate-950/40 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-950/70 transition"
+                  className={cx(controlButtonBase, controlButtonActive)}
                   title="Clear chat"
                 >
                   Clear

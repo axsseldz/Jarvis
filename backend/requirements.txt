@@ -4,3 +4,4 @@ pydantic
 httpx
 faiss-cpu 
 pymupdf
+python-multipart

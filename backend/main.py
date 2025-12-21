@@ -10,15 +10,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone
 from index import run_index  
+from fastapi import UploadFile, File
 import httpx
 import faiss
 import json
 import asyncio
-import traceback
+import os
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5-coder:14b"
-
+BASE_DIR = Path(__file__).resolve().parent.parent  # local-ai/
+DOCS_DIR = BASE_DIR / "data" / "documents"
+DOCS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_INTERVAL_SECONDS = 180  # 3 minutes (tune later)
 
 INDEX_LOCK = asyncio.Lock()
@@ -234,6 +237,51 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/docs/list")
+def docs_list():
+    items = []
+    for p in sorted(DOCS_DIR.glob("*")):
+        if not p.is_file():
+            continue
+        # keep it simple; you can filter extensions later
+        st = p.stat()
+        items.append({
+            "name": p.name,
+            "path": str(p),
+            "size": st.st_size,
+            "modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+        })
+    return {"docs": items}
+
+@app.post("/docs/upload")
+async def docs_upload(file: UploadFile = File(...)):
+    # Basic safety: no directories
+    filename = os.path.basename(file.filename or "upload.bin")
+    dest = DOCS_DIR / filename
+
+    # Avoid overwriting: add suffix if exists
+    if dest.exists():
+        stem = dest.stem
+        suf = dest.suffix
+        i = 1
+        while True:
+            candidate = DOCS_DIR / f"{stem}_{i}{suf}"
+            if not candidate.exists():
+                dest = candidate
+                break
+            i += 1
+
+    content = await file.read()
+    dest.write_bytes(content)
+
+    # Kick indexing in background (do NOT block)
+    try:
+        asyncio.create_task(_run_index_job("upload"))
+    except Exception:
+        pass
+
+    return {"ok": True, "saved_as": dest.name, "path": str(dest)}
 
 @app.get("/index/status")
 def index_status():
