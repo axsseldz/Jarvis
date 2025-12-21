@@ -11,11 +11,13 @@ from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone
 from index import run_index  
 from fastapi import UploadFile, File
+from typing import Any
 import httpx
 import faiss
 import json
 import asyncio
 import os
+import re
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5-coder:14b"
@@ -115,6 +117,75 @@ class RememberRequest(BaseModel):
     content: str
     source: str = "manual"
 
+def _normalize_q(q: str) -> str:
+    return (q or "").strip().lower()
+
+def looks_like_doc_question(q: str) -> bool:
+    """
+    Strong hints user wants *their* local docs.
+    """
+    q = _normalize_q(q)
+    doc_markers = [
+        "my ", "mine", "resume", "cv", "kardex", "transcript", "document",
+        "pdf", "file", "in this", "in the doc", "according to", "based on the document",
+        "from my", "from the pdf", "from the file", "what does it say"
+    ]
+    return any(m in q for m in doc_markers)
+
+def looks_like_general_question(q: str) -> bool:
+    """
+    Strong hints user wants general knowledge (even if local retrieval returns something vaguely similar).
+    """
+    q = _normalize_q(q)
+    general_markers = [
+        "what is", "who is", "explain", "how does", "define", "difference between",
+        "history of", "when did", "why does", "examples of", "best way to",
+    ]
+    # If it also looks like a doc question, don't force general.
+    return any(m in q for m in general_markers) and not looks_like_doc_question(q)
+
+def clamp(s: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    try:
+        return max(lo, min(hi, float(s)))
+    except Exception:
+        return lo
+
+async def llm_relevance_gate(question: str, sources: list[dict], model: str) -> tuple[bool, str]:
+    """
+    Optional small LLM 'judge' to prevent false positives:
+    - returns (use_local, reason)
+    Keep this tiny + deterministic.
+    """
+    # Take only a couple short snippets to keep it fast.
+    def snip(t: str, n: int = 420) -> str:
+        t = (t or "").strip()
+        return t[:n] + ("…" if len(t) > n else "")
+
+    blocks = []
+    for s in sources[:2]:
+        blocks.append(f"{s.get('label','S?')} ({s.get('doc_path','?')}):\n{snip(s.get('text_preview',''))}")
+
+    prompt = (
+        "You are a routing classifier for a local-docs assistant.\n"
+        "Decide if the QUESTION can be answered using ONLY the provided SOURCES.\n"
+        "If SOURCES are unrelated, say use_local=false.\n\n"
+        f"QUESTION:\n{question}\n\n"
+        "SOURCES:\n" + ("\n\n".join(blocks) if blocks else "(none)") + "\n\n"
+        "Respond ONLY as strict JSON: {\"use_local\": true/false, \"reason\": \"...\"}\n"
+    )
+
+    try:
+        raw = await ollama_generate(prompt, model)
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        if not m:
+            return False, "gate:no-json"
+        data = json.loads(m.group(0))
+        use_local = bool(data.get("use_local", False))
+        reason = str(data.get("reason", "")).strip()[:180]
+        return use_local, f"gate:{reason or 'ok'}"
+    except Exception:
+        return False, "gate:error"
+
 def infer_task(question: str) -> str:
     q = question.lower()
     summary_keywords = ["summarize", "summary", "overview", "bullet", "bullets", "tl;dr", "high level"]
@@ -191,7 +262,12 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
     chunks = get_chunks_by_vector_ids(vector_ids)
 
     if not chunks:
-        return None, [], {"top_k": k, "best_score": float(scores[0]) if scores else 0.0}
+        best = float(scores[0]) if scores else 0.0
+        top3 = [float(x) for x in (scores[:3] if scores else [])]
+        avg_top3 = sum(top3) / len(top3) if top3 else 0.0
+        gap = (float(scores[0]) - float(scores[1])) if scores and len(scores) > 1 else 0.0
+
+        return None, [], {"top_k": k, "best_score": best, "avg_top3": avg_top3, "score_gap": gap, "n_sources": 0}
 
     context_blocks = []
     sources = []
@@ -206,6 +282,8 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
             "doc_path": ch["doc_path"],
             "chunk_index": ch["chunk_index"],
             "score": float(src_score) if src_score is not None else None,
+            # small preview for routing gate (and optional UI later)
+            "text_preview": (ch["text"] or "")[:500],
         })
 
     if task == "summary":
@@ -231,8 +309,98 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
         f"{instructions}"
     )
 
-    return prompt, sources, {"top_k": k, "best_score": float(scores[0]) if scores else 0.0}
+    best = float(scores[0]) if scores else 0.0
+    top3 = [float(x) for x in (scores[:3] if scores else [])]
+    avg_top3 = sum(top3) / len(top3) if top3 else 0.0
+    gap = (float(scores[0]) - float(scores[1])) if scores and len(scores) > 1 else 0.0
 
+    return prompt, sources, {
+        "top_k": k,
+        "best_score": best,
+        "avg_top3": avg_top3,
+        "score_gap": gap,
+        "n_sources": len(sources),
+    }
+
+async def route_auto(question: str, task: str, top_k: int, model: str) -> dict[str, Any]:
+    """
+    Returns:
+      {
+        "final_mode": "auto->local"|"auto->general",
+        "prompt": <string>,
+        "sources": <list>,
+        "retrieval": <dict>,
+        "routing_reason": <string>
+      }
+    """
+    prompt_local, sources_local, retrieval_local = await build_local_prompt_and_sources(question, task, top_k)
+
+    best = clamp(retrieval_local.get("best_score", 0.0))
+    avg3 = clamp(retrieval_local.get("avg_top3", 0.0))
+    gap = clamp(retrieval_local.get("score_gap", 0.0), 0.0, 10.0)
+    nsrc = int(retrieval_local.get("n_sources", 0) or 0)
+
+    # Hard fallback if nothing retrieved
+    if prompt_local is None or nsrc == 0:
+        return {
+            "final_mode": "auto->general",
+            "prompt": question,
+            "sources": [],
+            "retrieval": {},
+            "routing_reason": "no-local-context",
+        }
+
+    # Thresholds (tune over time)
+    # - low confidence => general
+    if best < 0.38 or avg3 < 0.34:
+        return {
+            "final_mode": "auto->general",
+            "prompt": question,
+            "sources": [],
+            "retrieval": {},
+            "routing_reason": f"low-retrieval(best={best:.2f},avg3={avg3:.2f})",
+        }
+
+    # - very high confidence => local
+    if best >= 0.62:
+        return {
+            "final_mode": "auto->local",
+            "prompt": prompt_local,
+            "sources": sources_local,
+            "retrieval": retrieval_local,
+            "routing_reason": f"high-retrieval(best={best:.2f})",
+        }
+
+    # Middle zone: use heuristics + optional LLM gate to avoid false positives
+    if looks_like_doc_question(question):
+        return {
+            "final_mode": "auto->local",
+            "prompt": prompt_local,
+            "sources": sources_local,
+            "retrieval": retrieval_local,
+            "routing_reason": f"doc-intent(best={best:.2f})",
+        }
+
+    if looks_like_general_question(question) and gap < 0.10:
+        # If it looks general and retrieval isn't sharply confident, run a small gate
+        use_local, reason = await llm_relevance_gate(question, sources_local, model)
+        if not use_local:
+            return {
+                "final_mode": "auto->general",
+                "prompt": question,
+                "sources": [],
+                "retrieval": {},
+                "routing_reason": reason,
+            }
+
+    # Default: local
+    return {
+        "final_mode": "auto->local",
+        "prompt": prompt_local,
+        "sources": sources_local,
+        "retrieval": retrieval_local,
+        "routing_reason": f"mid-retrieval(best={best:.2f},gap={gap:.2f})",
+    }
 
 @app.get("/health")
 def health():
@@ -437,31 +605,32 @@ async def ask(req: AskRequest):
         return await run_local()
 
     if mode == "auto":
-        local_result = await run_local()
+        routed = await route_auto(req.question, task, req.top_k, model)
 
-        # If local QA can't answer, fall back to general automatically
-        if local_result.get("task") == "qa":
-            ans = (local_result.get("answer") or "").strip().lower()
-            if ans.startswith("i don't know") or "i don't know" in ans:
-                general_result = await run_general()
-                general_result["mode"] = "auto->general"
-                return general_result
+        if routed["final_mode"] == "auto->general":
+            result = await run_general()
+            result["mode"] = "auto->general"
+            result["routing_reason"] = routed["routing_reason"]
+            return result
 
-        # Also fallback if retrieval is missing/weak (still useful)
-        retrieval = local_result.get("retrieval", {})
-        best_score = float(retrieval.get("best_score", 0.0))
-        has_sources = bool(local_result.get("sources"))
+        # local
+        try:
+            answer = await ollama_generate(routed["prompt"], model)
+        except httpx.ConnectError:
+            raise HTTPException(status_code=503, detail="Cannot connect to Ollama. Is `ollama serve` running?")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
 
-        if should_fallback_to_general(
-            vector_ids=[1] if has_sources else [],
-            scores=[best_score] if has_sources else [],
-        ):
-            general_result = await run_general()
-            general_result["mode"] = "auto->general"
-            return general_result
-
-        local_result["mode"] = "auto->local"
-        return local_result
+        return {
+            "answer": answer,
+            "mode": "auto->local",
+            "task": task,
+            "sources": routed["sources"],
+            "used_tools": ["ollama", "faiss", "sqlite"],
+            "model": model,
+            "retrieval": routed["retrieval"],
+            "routing_reason": routed["routing_reason"],
+        }
 
     raise HTTPException(status_code=400, detail="Unsupported mode. Use 'auto', 'local', or 'general'.")
 
@@ -476,6 +645,7 @@ async def ask_stream(req: AskRequest):
         final_mode = mode
         sources = []
         retrieval = {}
+        routing_reason = None
 
         if mode == "general":
             prompt = req.question
@@ -490,22 +660,13 @@ async def ask_stream(req: AskRequest):
                 return
 
         elif mode == "auto":
-            prompt_local, sources_local, retrieval_local = await build_local_prompt_and_sources(req.question, task, req.top_k)
+            routed = await route_auto(req.question, task, req.top_k, model)
+            final_mode = routed["final_mode"]
+            prompt = routed["prompt"]
+            sources = routed["sources"]
+            retrieval = routed["retrieval"]
+            routing_reason = routed["routing_reason"]
 
-            # fallback decision (same heuristic as non-stream)
-            if prompt_local is None or should_fallback_to_general(
-                vector_ids=[1] if sources_local else [],
-                scores=[float(retrieval_local.get("best_score", 0.0))] if sources_local else [],
-            ):
-                final_mode = "auto->general"
-                prompt = req.question
-                sources = []
-                retrieval = {}
-            else:
-                final_mode = "auto->local"
-                prompt = prompt_local
-                sources = sources_local
-                retrieval = retrieval_local
         else:
             meta = {"mode": "error", "task": task, "sources": [], "model": model}
             yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
@@ -514,7 +675,14 @@ async def ask_stream(req: AskRequest):
             return
 
         # Send meta first (frontend uses this to set sources/mode/task)
-        meta = {"mode": final_mode, "task": task, "sources": sources, "model": model, "retrieval": retrieval}
+        meta = {
+            "mode": final_mode,
+            "task": task,
+            "sources": sources,
+            "model": model,
+            "retrieval": retrieval,
+            "routing_reason": routing_reason if mode == "auto" else None,
+        }
         yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
 
         # Stream tokens

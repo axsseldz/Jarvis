@@ -34,6 +34,7 @@ type ChatMessage = {
   model?: string;
   sources?: Source[];
   error?: boolean;
+  routing_reason?: string;
 };
 
 type IndexStatus = {
@@ -208,6 +209,7 @@ export default function Page() {
                       task: meta.task,
                       model: meta.model,
                       sources: meta.sources || [],
+                      routing_reason: meta.routing_reason || undefined,
                     }
                     : m
                 )
