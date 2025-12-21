@@ -36,6 +36,22 @@ type ChatMessage = {
   error?: boolean;
 };
 
+type IndexStatus = {
+  state: "idle" | "running" | "ok" | "error";
+  is_indexing: boolean;
+  last_trigger?: string | null;
+  last_started_at?: string | null;
+  last_finished_at?: string | null;
+  last_error?: string | null;
+  stats?: {
+    files_on_disk: number;
+    indexed_files: number;
+    skipped_files: number;
+    deleted_files: number;
+    chunks_indexed: number;
+  } | null;
+};
+
 function cx(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
 }
@@ -50,6 +66,8 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
+  const [indexStarting, setIndexStarting] = useState(false);
 
   const chatRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -58,6 +76,29 @@ export default function Page() {
     });
     return () => cancelAnimationFrame(id);
   }, [messages]);
+
+  useEffect(() => {
+    fetchIndexStatus();
+
+    const t = setInterval(() => {
+      // poll faster while running
+      const running = indexStatus?.is_indexing;
+      if (running) fetchIndexStatus();
+    }, 1200);
+
+    const slow = setInterval(() => {
+      // poll slow when idle
+      const running = indexStatus?.is_indexing;
+      if (!running) fetchIndexStatus();
+    }, 8000);
+
+    return () => {
+      clearInterval(t);
+      clearInterval(slow);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [indexStatus?.is_indexing]);
+
 
   const canAsk = useMemo(() => question.trim().length > 0 && !loading, [question, loading]);
 
@@ -206,6 +247,27 @@ export default function Page() {
       setLoading(false);
     }
 
+  }
+
+  async function fetchIndexStatus() {
+    try {
+      const r = await fetch("http://localhost:8000/index/status");
+      const data = (await r.json()) as IndexStatus;
+      setIndexStatus(data);
+    } catch {
+      // ignore (backend may be down)
+    }
+  }
+
+  async function startIndexNow() {
+    try {
+      setIndexStarting(true);
+      await fetch("http://localhost:8000/index/run", { method: "POST" });
+      // refresh quickly after starting
+      setTimeout(fetchIndexStatus, 400);
+    } finally {
+      setIndexStarting(false);
+    }
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -401,14 +463,52 @@ export default function Page() {
                 </span>
               </div>
 
-              <div className="text-xs text-zinc-500">{question.trim().length} chars</div>
-              <button
-                onClick={clearChat}
-                className="rounded-xl border border-slate-800/70 bg-slate-950/40 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-950/70 transition"
-                title="Clear chat"
-              >
-                Clear
-              </button>
+              <div className="flex items-center gap-2">
+                {/* Index status pill */}
+                <div
+                  className={cx(
+                    "rounded-xl border px-3 py-1.5 text-xs font-semibold",
+                    indexStatus?.state === "running" && "border-cyan-500/30 text-cyan-200 bg-cyan-500/10",
+                    indexStatus?.state === "ok" && "border-emerald-500/25 text-emerald-200 bg-emerald-500/10",
+                    indexStatus?.state === "error" && "border-rose-500/25 text-rose-200 bg-rose-500/10",
+                    (!indexStatus || indexStatus?.state === "idle") && "border-slate-800/70 text-slate-300 bg-slate-950/40"
+                  )}
+                  title={
+                    indexStatus?.state === "error"
+                      ? indexStatus?.last_error ?? "Index error"
+                      : indexStatus?.stats
+                        ? `files=${indexStatus.stats.files_on_disk}, indexed=${indexStatus.stats.indexed_files}, skipped=${indexStatus.stats.skipped_files}, deleted=${indexStatus.stats.deleted_files}`
+                        : "Index status"
+                  }
+                >
+                  {indexStatus?.is_indexing ? "Indexing…" : `Index: ${indexStatus?.state ?? "…"}`}
+                </div>
+
+                {/* Index now */}
+                <button
+                  onClick={startIndexNow}
+                  disabled={!!indexStatus?.is_indexing || indexStarting}
+                  className={cx(
+                    "rounded-xl border px-3 py-1.5 text-xs font-semibold transition",
+                    indexStatus?.is_indexing || indexStarting
+                      ? "border-slate-800/70 bg-slate-950/30 text-slate-500 cursor-not-allowed"
+                      : "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:bg-slate-950/70"
+                  )}
+                  title="Run indexing now"
+                >
+                  Index now
+                </button>
+
+                {/* Clear */}
+                <button
+                  onClick={clearChat}
+                  className="rounded-xl border border-slate-800/70 bg-slate-950/40 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-950/70 transition"
+                  title="Clear chat"
+                >
+                  Clear
+                </button>
+              </div>
+
             </div>
 
             <div className="mt-2 flex items-end gap-3">

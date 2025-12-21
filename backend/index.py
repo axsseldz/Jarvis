@@ -24,7 +24,7 @@ def iter_files():
             if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
                 yield p.resolve()
 
-async def main():
+async def run_index():
     init_db()
 
     files_on_disk = list(iter_files())
@@ -79,6 +79,7 @@ async def main():
 
     indexed_count = 0
     skipped_count = 0
+    chunks_indexed = 0
 
     for path in files_on_disk:
         path_str = str(path)
@@ -128,6 +129,8 @@ async def main():
         # Save chunks rows
         insert_chunks(doc_id, chunks, vector_ids)
 
+        chunks_indexed += len(chunks)
+
         # Add to FAISS
         add_vectors(index, vecs, vector_ids)
         save(index)
@@ -137,5 +140,13 @@ async def main():
 
     print(f"Done. indexed={indexed_count}, skipped={skipped_count}, deleted={len(deleted_paths)}")
 
+    return {
+        "files_on_disk": len(files_on_disk),
+        "indexed_files": indexed_count,
+        "skipped_files": skipped_count,
+        "deleted_files": len(deleted_paths),
+        "chunks_indexed": chunks_indexed,
+    }
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_index())

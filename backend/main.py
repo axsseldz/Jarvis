@@ -8,17 +8,88 @@ from db import get_chunks_by_vector_ids
 from pathlib import Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from datetime import datetime, timezone
+from index import run_index  
 import httpx
 import faiss
 import json
+import asyncio
+import traceback
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5-coder:14b"
 
+INDEX_INTERVAL_SECONDS = 180  # 3 minutes (tune later)
+
+INDEX_LOCK = asyncio.Lock()
+INDEX_STATUS = {
+    "state": "idle",               # idle | running | ok | error
+    "is_indexing": False,
+    "last_trigger": None,          # "startup" | "scheduled" | "manual"
+    "last_started_at": None,
+    "last_finished_at": None,
+    "last_error": None,
+    "stats": None,
+}
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+async def _run_index_job(trigger: str):
+    # Prevent overlapping runs
+    if INDEX_LOCK.locked():
+        return False
+
+    async with INDEX_LOCK:
+        INDEX_STATUS["state"] = "running"
+        INDEX_STATUS["is_indexing"] = True
+        INDEX_STATUS["last_trigger"] = trigger
+        INDEX_STATUS["last_started_at"] = _now_iso()
+        INDEX_STATUS["last_error"] = None
+
+        try:
+            stats = await run_index()
+            INDEX_STATUS["stats"] = stats
+            INDEX_STATUS["state"] = "ok"
+        except Exception as e:
+            INDEX_STATUS["state"] = "error"
+            INDEX_STATUS["last_error"] = f"{type(e).__name__}: {str(e)}"
+            # Optional: keep traceback for debugging
+            # print(traceback.format_exc())
+        finally:
+            INDEX_STATUS["is_indexing"] = False
+            INDEX_STATUS["last_finished_at"] = _now_iso()
+
+    return True
+
+async def _index_daemon(stop_event: asyncio.Event):
+    # Run once on startup
+    await _run_index_job("startup")
+
+    while not stop_event.is_set():
+        try:
+            # wait N seconds or stop
+            await asyncio.wait_for(stop_event.wait(), timeout=INDEX_INTERVAL_SECONDS)
+        except asyncio.TimeoutError:
+            # time to run scheduled indexing
+            await _run_index_job("scheduled")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    yield
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(_index_daemon(stop_event))
+
+    try:
+        yield
+    finally:
+        stop_event.set()
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
 
 app = FastAPI(title="Local AI Backend", lifespan=lifespan)
 
@@ -163,6 +234,19 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/index/status")
+def index_status():
+    return INDEX_STATUS
+
+@app.post("/index/run")
+async def index_run():
+    # fire-and-forget (don’t block request)
+    if INDEX_LOCK.locked():
+        return {"ok": False, "started": False, "status": INDEX_STATUS}
+
+    asyncio.create_task(_run_index_job("manual"))
+    return {"ok": True, "started": True, "status": INDEX_STATUS}
 
 @app.post("/remember")
 def remember(req: RememberRequest):
