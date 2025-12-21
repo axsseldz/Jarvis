@@ -6,6 +6,7 @@ from embeddings import embed_texts
 from faiss_store import search as faiss_search
 from db import get_chunks_by_vector_ids
 from pathlib import Path
+from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import faiss
 
@@ -19,11 +20,46 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Local AI Backend", lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class AskRequest(BaseModel):
     question: str
-    mode: str = "general"  # general | local | web (later)
+    mode: str = "auto"          # auto | local | general
     model: str | None = None
-    top_k: int = 5
+    top_k: int = 6
+    task: str | None = None     # qa | summary | None (auto-infer)
+
+def infer_task(question: str) -> str:
+    q = question.lower()
+    summary_keywords = ["summarize", "summary", "overview", "bullet", "bullets", "tl;dr", "high level"]
+    if any(k in q for k in summary_keywords):
+        return "summary"
+    return "qa"
+
+def should_fallback_to_general(vector_ids: list[int], scores: list[float]) -> bool:
+    """
+    Heuristic: if we retrieved nothing OR the best similarity score is low,
+    the question is probably not answerable from local docs.
+    Tune threshold based on your embeddings/model.
+    """
+    if not vector_ids:
+        return True
+    best = scores[0] if scores else 0.0
+    return best < 0.38  # adjust if needed (0.33-0.45 typical)
+
+async def ollama_generate(prompt: str, model: str) -> str:
+    payload = {"model": model, "prompt": prompt, "stream": False}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("response", "")
 
 def load_faiss_index():
     idx_path = Path(__file__).parent / "vector_index" / "index.faiss"
@@ -54,88 +90,155 @@ def memory_search(q: str, limit: int = 10):
 @app.post("/ask")
 async def ask(req: AskRequest):
     model = req.model or DEFAULT_MODEL
+    task = req.task or infer_task(req.question)
 
-    if req.mode == "general":
-        payload = {"model": model, "prompt": req.question, "stream": False}
+    # ---------- GENERAL MODE ----------
+    async def run_general() -> dict:
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
-                r.raise_for_status()
-                data = r.json()
-        except httpx.ConnectError:
-            raise HTTPException(status_code=503, detail="Cannot connect to Ollama. Is `ollama serve` running?")
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
-
-        return {"answer": data.get("response", ""), "mode": req.mode, "sources": [], "used_tools": ["ollama"], "model": model}
-
-    if req.mode == "local":
-        # Embed the question
-        q_vec = (await embed_texts([req.question]))[0]
-
-        # Search FAISS
-        index = load_faiss_index()
-        if index is None:
-            raise HTTPException(status_code=400, detail="No FAISS index found. Run `python index.py` first.")
-
-        scores, vector_ids = faiss_search(index, q_vec, top_k=req.top_k)
-
-        # Fetch chunk texts for those vector IDs
-        chunks = get_chunks_by_vector_ids(vector_ids)
-
-        if not chunks:
-            return {
-                "answer": "I couldn't find anything relevant in your local documents yet. Try re-indexing or asking differently.",
-                "mode": req.mode,
-                "sources": [],
-                "used_tools": ["ollama", "faiss", "sqlite"],
-                "model": model,
-            }
-
-        # Build a grounded prompt with citations
-        context_blocks = []
-        sources = []
-        for i, (ch, score) in enumerate(zip(chunks, scores)):
-            label = f"S{i+1}"
-            context_blocks.append(
-                f"[{label}] doc={ch['doc_path']} chunk={ch['chunk_index']}\n{ch['text']}"
-            )
-            sources.append({
-                "label": label,
-                "doc_path": ch["doc_path"],
-                "chunk_index": ch["chunk_index"],
-                "score": score,
-            })
-
-        prompt = (
-            "You are a local, privacy-first assistant. Answer ONLY using the provided SOURCES.\n"
-            "If the answer is not in the sources, say you don't know.\n\n"
-            f"QUESTION:\n{req.question}\n\n"
-            "SOURCES:\n" + "\n\n".join(context_blocks) + "\n\n"
-            "INSTRUCTIONS:\n"
-            "- Provide a clear answer.\n"
-            "- Cite sources inline like [S1], [S2].\n"
-        )
-
-        payload = {"model": model, "prompt": prompt, "stream": False}
-
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
-                r.raise_for_status()
-                data = r.json()
+            answer = await ollama_generate(req.question, model)
         except httpx.ConnectError:
             raise HTTPException(status_code=503, detail="Cannot connect to Ollama. Is `ollama serve` running?")
         except httpx.HTTPError as e:
             raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
 
         return {
-            "answer": data.get("response", ""),
-            "mode": req.mode,
-            "sources": sources,
-            "used_tools": ["ollama", "faiss", "sqlite"],
+            "answer": answer,
+            "mode": "general",
+            "task": task,
+            "sources": [],
+            "used_tools": ["ollama"],
             "model": model,
         }
 
-    raise HTTPException(status_code=400, detail="Unsupported mode. Use 'general' or 'local' for now.")
+    # ---------- LOCAL MODE ----------
+    async def run_local() -> dict:
+        # 1) Embed the question
+        q_vec = (await embed_texts([req.question]))[0]
+
+        # 2) Load FAISS index
+        index = load_faiss_index()
+        if index is None:
+            # No local KB yet
+            return {
+                "answer": "No local index found yet. Run indexing first, or use General mode.",
+                "mode": "local",
+                "task": task,
+                "sources": [],
+                "used_tools": ["ollama", "faiss", "sqlite"],
+                "model": model,
+            }
+
+        # 3) Retrieval settings
+        k = req.top_k
+        if task == "summary":
+            k = max(k, 12)  # summaries usually need more context
+
+        scores, vector_ids = faiss_search(index, q_vec, top_k=k)
+        chunks = get_chunks_by_vector_ids(vector_ids)
+
+        if not chunks:
+            return {
+                "answer": "I couldn't find anything relevant in your local documents.",
+                "mode": "local",
+                "task": task,
+                "sources": [],
+                "used_tools": ["ollama", "faiss", "sqlite"],
+                "model": model,
+            }
+
+        # 4) Build context blocks + sources
+        context_blocks = []
+        sources = []
+        for i, ch in enumerate(chunks):
+            label = f"S{i+1}"
+            context_blocks.append(
+                f"[{label}] doc={ch['doc_path']} chunk={ch['chunk_index']}\n{ch['text']}"
+            )
+            src_score = scores[i] if i < len(scores) else None
+            sources.append({
+                "label": label,
+                "doc_path": ch["doc_path"],
+                "chunk_index": ch["chunk_index"],
+                "score": float(src_score) if src_score is not None else None,
+            })
+
+        # 5) Task-aware instructions (QA vs Summary)
+        if task == "summary":
+            instructions = (
+                "TASK: Summarize using ONLY the provided SOURCES.\n"
+                "You MUST synthesize a summary even if the sources are split across chunks.\n"
+                "Do NOT say 'I don't know' just because a summary isn't explicitly written.\n"
+                "If important sections are missing, make a partial summary and say what seems missing.\n"
+                "Follow the user's format request (e.g. bullet points).\n"
+                "Cite sources inline like [S1], [S2].\n"
+            )
+        else:
+            instructions = (
+                "TASK: Answer using ONLY the provided SOURCES.\n"
+                "If the answer cannot be found in the sources, say 'I don't know'.\n"
+                "Cite sources inline like [S1], [S2].\n"
+            )
+
+        prompt = (
+            "You are a local, privacy-first assistant.\n\n"
+            f"QUESTION:\n{req.question}\n\n"
+            "SOURCES:\n" + "\n\n".join(context_blocks) + "\n\n"
+            f"{instructions}"
+        )
+
+        try:
+            answer = await ollama_generate(prompt, model)
+        except httpx.ConnectError:
+            raise HTTPException(status_code=503, detail="Cannot connect to Ollama. Is `ollama serve` running?")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
+
+        return {
+            "answer": answer,
+            "mode": "local",
+            "task": task,
+            "sources": sources,
+            "used_tools": ["ollama", "faiss", "sqlite"],
+            "model": model,
+            # handy for debugging
+            "retrieval": {"top_k": k, "best_score": float(scores[0]) if scores else 0.0},
+        }
+
+    # ---------- ROUTING ----------
+    mode = (req.mode or "auto").lower().strip()
+
+    if mode == "general":
+        return await run_general()
+
+    if mode == "local":
+        return await run_local()
+
+    if mode == "auto":
+        local_result = await run_local()
+
+        # If local QA can't answer, fall back to general automatically
+        if local_result.get("task") == "qa":
+            ans = (local_result.get("answer") or "").strip().lower()
+            if ans.startswith("i don't know") or "i don't know" in ans:
+                general_result = await run_general()
+                general_result["mode"] = "auto->general"
+                return general_result
+
+        # Also fallback if retrieval is missing/weak (still useful)
+        retrieval = local_result.get("retrieval", {})
+        best_score = float(retrieval.get("best_score", 0.0))
+        has_sources = bool(local_result.get("sources"))
+
+        if should_fallback_to_general(
+            vector_ids=[1] if has_sources else [],
+            scores=[best_score] if has_sources else [],
+        ):
+            general_result = await run_general()
+            general_result["mode"] = "auto->general"
+            return general_result
+
+        local_result["mode"] = "auto->local"
+        return local_result
+
+    raise HTTPException(status_code=400, detail="Unsupported mode. Use 'auto', 'local', or 'general'.")
 

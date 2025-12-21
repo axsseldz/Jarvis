@@ -1,6 +1,12 @@
 backend/.localAiEenv/
 backend/__pycache__/
 backend/memory.db
-backend/data/
+data/
 backend/vector_index/
 .vscode/
+
+frontend/node_modules/
+frontend/.next/
+frontend/.env*
+
+.DS_Store

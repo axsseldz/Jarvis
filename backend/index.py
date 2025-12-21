@@ -7,10 +7,12 @@ from chunking import chunk_text
 from embeddings import embed_texts
 from faiss_store import load_or_create, save, add_vectors, remove_ids
 
-BASE_DATA_DIR = Path(__file__).resolve().parent / "data"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # local-ai/
+DATA_ROOT = PROJECT_ROOT / "data"
+
 INDEX_PATHS = [
-    BASE_DATA_DIR / "documents",
-    BASE_DATA_DIR / "notes",
+    DATA_ROOT / "documents",
+    DATA_ROOT / "notes",
 ]
 
 SUPPORTED_EXTS = {".pdf", ".txt", ".md"}
@@ -28,7 +30,7 @@ async def main():
     files_on_disk = list(iter_files())
     disk_paths = set(str(p) for p in files_on_disk)
 
-    # 1) Detect deletions 
+    # Detect deletions 
     # We can only detect deletions for docs we previously indexed; easiest is:
     # - Look at docs table, compare to disk_paths.
     from db import list_active_document_paths
