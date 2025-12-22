@@ -23,7 +23,7 @@ import time
 import re
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "qwen2.5-coder:14b"
+DEFAULT_MODEL = "llama3.1:8b"
 BASE_DIR = Path(__file__).resolve().parent.parent  # local-ai/
 DOCS_DIR = BASE_DIR / "data" / "documents"
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
@@ -71,6 +71,7 @@ def _run_cmd(cmd: list[str], timeout: float = 1.5) -> str | None:
 def _parse_vm_stat(out: str) -> tuple[int | None, int | None]:
     if not out:
         return None, None
+
     page_size = 4096
     first_line = out.splitlines()[0] if out else ""
     m = re.search(r"page size of (\d+) bytes", first_line)
@@ -78,11 +79,16 @@ def _parse_vm_stat(out: str) -> tuple[int | None, int | None]:
         page_size = int(m.group(1))
 
     def grab(key: str) -> int:
-        m2 = re.search(rf"{key}:\s+([\d]+)\.", out)
+        m2 = re.search(rf"{re.escape(key)}:\s+([\d]+)\.", out)
         return int(m2.group(1)) if m2 else 0
 
-    free = grab("Pages free") + grab("Pages speculative")
-    total = sum(
+    # Treat these as truly "used" (non-reclaimable-ish)
+    active = grab("Pages active")
+    wired = grab("Pages wired down")
+    compressed = grab("Pages occupied by compressor")
+
+    # Total ≈ sum of the major buckets
+    total_pages = sum(
         grab(k)
         for k in [
             "Pages active",
@@ -95,11 +101,12 @@ def _parse_vm_stat(out: str) -> tuple[int | None, int | None]:
             "Pages free",
         ]
     )
-    if total == 0:
+    if total_pages == 0:
         return None, None
-    free_bytes = free * page_size
-    used_bytes = (total * page_size) - free_bytes
-    return used_bytes, total * page_size
+
+    used_pages = active + wired + compressed
+    return used_pages * page_size, total_pages * page_size
+
 
 def _parse_swap(out: str) -> tuple[int | None, int | None]:
     if not out:
@@ -339,7 +346,15 @@ async def ollama_stream(prompt: str, model: str):
     """
     Yields text chunks from Ollama as they arrive (NDJSON stream).
     """
-    payload = {"model": model, "prompt": prompt, "stream": True}
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": True, 
+        "options": {
+            "num_ctx": 4096,
+            "temperature": 0.6,
+        },
+    }
 
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", f"{OLLAMA_BASE_URL}/api/generate", json=payload) as r:
@@ -362,7 +377,16 @@ async def ollama_stream(prompt: str, model: str):
                     break
 
 async def ollama_generate(prompt: str, model: str) -> str:
-    payload = {"model": model, "prompt": prompt, "stream": False}
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False, 
+        "options": {
+            "num_ctx": 4096,
+            "temperature": 0.6,
+        },
+    }
+
     async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
         r.raise_for_status()
@@ -483,10 +507,10 @@ def metrics():
             "last_updated": LLM_METRICS["last_updated"],
         },
         "model": {
-            "name": DEFAULT_MODEL,
-            "quantization": None,
-            "backend": "Ollama",
-        },
+        "name": DEFAULT_MODEL,
+        "quantization": "Q4_K_M",
+        "backend": "Ollama",
+    },
     }
 
 @app.post("/voice/transcribe")
@@ -620,10 +644,11 @@ async def ask(req: AskRequest):
     # ---------- GENERAL MODE ----------
     async def run_general() -> dict:
         prompt = (
-            "You are a helpful assistant.\n"
-            "Keep answers short by default; only go long if the user explicitly asks for a detailed/extended answer.\n"
-            "Do NOT invent source mentions.\n\n"
-            f"QUESTION:\n{req.question}\n"
+            "You are a helpful, conversational AI assistant.\n"
+            "Be clear, natural, and concise.\n"
+            "Only provide long explanations if the user explicitly asks.\n"
+            "If something is ambiguous, ask a clarifying question.\n\n"
+            f"User question:\n{req.question}\n"
         )
         try:
             answer = await ollama_generate(prompt, model)
@@ -794,11 +819,12 @@ async def ask_stream(req: AskRequest):
         retrieval = {}
         if mode == "general":
             prompt = (
-                "You are a helpful assistant.\n"
-                "Keep answers short by default; only go long if the user explicitly asks for a detailed/extended answer.\n"
-                "Do NOT invent source mentions.\n\n"
-                f"QUESTION:\n{req.question}\n"
-            )
+            "You are a helpful, conversational AI assistant.\n"
+            "Be clear, natural, and concise.\n"
+            "Only provide long explanations if the user explicitly asks.\n"
+            "If something is ambiguous, ask a clarifying question.\n\n"
+            f"User question:\n{req.question}\n"
+        )
 
         elif mode == "search":
             try:
