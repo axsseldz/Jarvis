@@ -173,6 +173,7 @@ export default function Page() {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const spokenSentencesRef = useRef<Set<string>>(new Set());
   const ttsRemainderRef = useRef<string>("");
+  const conversationIdRef = useRef(uid("c"));
   const [ttsMuted, setTtsMuted] = useState(true);
   const [liveTranscript, setLiveTranscript] = useState("");
 
@@ -585,7 +586,7 @@ export default function Page() {
           "Content-Type": "application/json",
           Accept: "text/event-stream",
         },
-        body: JSON.stringify({ question: q, mode, top_k: 10, model }),
+        body: JSON.stringify({ question: q, mode, top_k: 10, model, conversation_id: conversationIdRef.current }),
       });
 
       if (!res.ok || !res.body) throw new Error(`Streaming failed: ${res.status}`);
@@ -721,6 +722,7 @@ export default function Page() {
   function clearChat() {
     setMessages([]);
     setError("");
+    conversationIdRef.current = uid("c");
   }
 
   useEffect(() => {
@@ -1380,12 +1382,48 @@ export default function Page() {
                                       </code>
                                     );
                                   }
+                                  const codeText = Array.isArray(children) ? children.join("") : String(children ?? "");
                                   return (
-                                    <pre className="my-4 overflow-x-auto rounded-xl bg-black/40 p-4 text-sm border border-white/10 font-mono">
-                                      <code className={className} {...props}>
-                                        {children}
-                                      </code>
-                                    </pre>
+                                    <div className="my-4 rounded-xl border border-white/10 bg-black/40">
+                                      <div className="relative">
+                                        <button
+                                          type="button"
+                                          className="absolute right-2 top-2 inline-flex items-center gap-1.5 rounded-md border border-cyan-400/40 bg-linear-to-r from-cyan-500/15 via-sky-500/10 to-teal-500/15 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-100/90 shadow-[0_0_12px_rgba(34,211,238,0.15)] transition hover:border-cyan-300/70 hover:text-cyan-100 hover:shadow-[0_0_14px_rgba(34,211,238,0.25)]"
+                                          onClick={(e) => {
+                                            const btn = e.currentTarget;
+                                            if (!navigator?.clipboard) return;
+                                            navigator.clipboard.writeText(codeText).then(() => {
+                                              btn.setAttribute("data-state", "copied");
+                                              btn.textContent = "Copied";
+                                              window.setTimeout(() => {
+                                                btn.removeAttribute("data-state");
+                                                btn.textContent = "Copy";
+                                              }, 1200);
+                                            });
+                                          }}
+                                        >
+                                          <svg
+                                            className="h-3 w-3"
+                                            viewBox="0 0 24 24"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            strokeWidth="1.6"
+                                            strokeLinecap="round"
+                                            strokeLinejoin="round"
+                                            aria-hidden="true"
+                                          >
+                                            <rect x="9" y="9" width="12" height="12" rx="2" />
+                                            <path d="M5 15V5a2 2 0 0 1 2-2h10" />
+                                          </svg>
+                                          Copy
+                                        </button>
+                                        <pre className="overflow-x-auto rounded-xl p-4 text-sm font-mono">
+                                          <code className={className} {...props}>
+                                            {children}
+                                          </code>
+                                        </pre>
+                                      </div>
+                                    </div>
                                   );
                                 },
                               }}

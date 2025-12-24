@@ -37,6 +37,10 @@ MODEL_SWITCH_LOCK = asyncio.Lock()
 _METAL_CACHE = {"value": None, "ts": 0.0}
 _vosk_model = None
 _CURRENT_LLM_MODEL: str | None = None
+CONVERSATION_LOCK = asyncio.Lock()
+CONVERSATIONS: dict[str, dict] = {}
+MAX_CONTEXT_TOKENS = 2200
+MAX_RECENT_TURNS = 3
 
 FORMAT_RULES = (
     "FORMAT:\n"
@@ -100,7 +104,8 @@ class AskRequest(BaseModel):
     mode: str = "local" 
     model: str | None = None
     top_k: int = 6
-    task: str | None = None   
+    task: str | None = None
+    conversation_id: str | None = None  
 
 async def _run_index_job(trigger: str):
     if INDEX_LOCK.locked():
@@ -171,7 +176,7 @@ async def brave_web_search(query: str, count: int = 5):
     return results
 
 async def ollama_stream(prompt: str, model: str):
-    num_ctx = 5120 if model == "qwen2.5-coder:14b" else 3072
+    num_ctx = 5120 if model == "qwen2.5-coder:14b" else 4072
     payload = {
         "model": model,
         "prompt": prompt,
@@ -229,12 +234,12 @@ async def _switch_llm_model(next_model: str) -> None:
             await _ollama_unload_model(prev)
         _CURRENT_LLM_MODEL = next_model
     
-async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -> tuple[str | None, list, dict]:
+async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -> tuple[str | None, list, dict, list[str]]:
     q_vec = (await embed_texts([question]))[0]
 
     index = load_faiss_index()
     if index is None:
-        return None, [], {"top_k": top_k, "best_score": 0.0}
+        return None, [], {"top_k": top_k, "best_score": 0.0}, []
 
     k = top_k
     if task == "summary":
@@ -249,7 +254,7 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
         avg_top3 = sum(top3) / len(top3) if top3 else 0.0
         gap = (float(scores[0]) - float(scores[1])) if scores and len(scores) > 1 else 0.0
 
-        return None, [], {"top_k": k, "best_score": best, "avg_top3": avg_top3, "score_gap": gap, "n_sources": 0}
+        return None, [], {"top_k": k, "best_score": best, "avg_top3": avg_top3, "score_gap": gap, "n_sources": 0}, []
 
     context_blocks = []
     sources = []
@@ -304,7 +309,93 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
         "avg_top3": avg_top3,
         "score_gap": gap,
         "n_sources": len(sources),
+    }, context_blocks
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, int(len(text) / 4))
+
+def _render_messages(messages: list[dict]) -> str:
+    lines = []
+    for m in messages:
+        role = (m.get("role") or "user").title()
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+def _format_sources_block(sources: list[str], heading: str) -> str:
+    if not sources:
+        return ""
+    return f"{heading}\n" + "\n\n".join(sources)
+
+def _build_system_prompt(mode: str, task: str) -> str:
+    lines = ["You are a local, privacy-first assistant."]
+    if mode == "general":
+        lines.extend([
+            "Keep answers short by default; only go long if the user explicitly asks.",
+            "Do NOT invent sources.",
+        ])
+    elif task == "summary":
+        lines.extend([
+            "TASK: Summarize using ONLY the provided SOURCES.",
+            "You MUST synthesize a summary even if the sources are split across chunks.",
+            "Do NOT say 'I don't know' just because a summary isn't explicitly written.",
+            "If important sections are missing, make a partial summary and say what seems missing.",
+            "Follow the user's format request (e.g. bullet points).",
+            "Keep it concise unless the user explicitly asks for a detailed/long answer.",
+            "Do NOT cite or mention source IDs or filenames in the answer.",
+        ])
+    else:
+        lines.extend([
+            "TASK: Answer using ONLY the provided SOURCES.",
+            "If the answer cannot be found in the sources, say 'I don't know'.",
+            "Keep it concise unless the user explicitly asks for a detailed/long answer.",
+            "Do NOT cite or mention source IDs or filenames in the answer.",
+        ])
+    lines.append(FORMAT_RULES)
+    return "\n".join(lines).strip()
+
+def _build_memory_prompt(system_prompt: str, summary: str, messages: list[dict], user_payload: str) -> str:
+    parts = [f"SYSTEM:\n{system_prompt}"]
+    if summary:
+        parts.append("SYSTEM:\nCONVERSATION CONTEXT (summary):\n" + summary.strip())
+    if messages:
+        rendered = _render_messages(messages)
+        if rendered:
+            parts.append("RECENT MESSAGES:\n" + rendered)
+    parts.append("USER:\n" + user_payload.strip())
+    return "\n\n".join(parts).strip()
+
+def _build_summary_prompt(summary: str, messages: list[dict]) -> str:
+    parts = [
+        "Summarize the conversation below, focusing on user goals, constraints, decisions, and important facts, and keep it concise."
+    ]
+    if summary:
+        parts.append("EXISTING SUMMARY:\n" + summary.strip())
+    rendered = _render_messages(messages)
+    if rendered:
+        parts.append("MESSAGES:\n" + rendered)
+    return "\n\n".join(parts).strip()
+
+async def _ollama_generate(prompt: str, model: str) -> str:
+    if not prompt:
+        return ""
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.3,
+        },
     }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return (data.get("response") or "").strip()
 
 def _run_cmd(cmd: list[str], timeout: float = 1.5) -> str | None:
     try:
@@ -432,23 +523,6 @@ def _get_metal_status() -> bool | None:
     _METAL_CACHE["ts"] = now
     return supported
 
-def build_web_prompt(question: str, results: list[dict]) -> str:
-    blocks = []
-    for r in results:
-        blocks.append(
-            f"[{r['label']}] {r.get('title','')}\nURL: {r.get('url','')}\nSnippet: {r.get('snippet','')}"
-        )
-
-    return (
-        "You are a privacy-first assistant.\n"
-        "Use ONLY the WEB SOURCES below to answer.\n"
-        "Keep the answer short by default; only go long if the user explicitly asks for detail.\n"
-        "Do NOT cite or mention source IDs or websites inside the answer.\n"
-        "If the sources don't contain enough info, say what is missing.\n\n"
-        f"QUESTION:\n{question}\n\n"
-        "WEB SOURCES:\n" + "\n\n".join(blocks) + "\n"
-    )
-
 def get_vosk_model():
     global _vosk_model
     if _vosk_model is None:
@@ -575,21 +649,17 @@ async def ask_stream(req: AskRequest):
     model = req.model or DEFAULT_MODEL
     task = req.task or infer_task(req.question)
     mode = (req.mode or "local").lower().strip()
+    conversation_id = req.conversation_id or "default"
 
     async def sse():
         await _switch_llm_model(model)
         final_mode = mode
         sources = []
         retrieval = {}
+        context_blocks: list[str] = []
         
         if mode == "general":
-            prompt = (
-                "You are a helpful assistant.\n"
-                "Keep answers short by default; only go long if the user explicitly asks.\n"
-                "Do NOT invent sources.\n\n"
-                f"{FORMAT_RULES}\n"
-                f"QUESTION:\n{req.question}\n"
-            )
+            prompt = None
 
         elif mode == "search":
             try:
@@ -609,12 +679,15 @@ async def ask_stream(req: AskRequest):
                 return
 
             sources = results
-            prompt = build_web_prompt(req.question, results)
             final_mode = "search"
+            context_blocks = [
+                f"[{r['label']}] {r.get('title','')}\nURL: {r.get('url','')}\nSnippet: {r.get('snippet','')}"
+                for r in results
+            ]
 
 
         elif mode == "local":
-            prompt, sources, retrieval = await build_local_prompt_and_sources(req.question, task, req.top_k)
+            prompt, sources, retrieval, context_blocks = await build_local_prompt_and_sources(req.question, task, req.top_k)
             if prompt is None:
                 meta = {"mode": "local", "task": task, "sources": [], "model": model, "retrieval": retrieval}
                 yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
@@ -629,6 +702,39 @@ async def ask_stream(req: AskRequest):
             yield "event: done\ndata: {}\n\n"
             return
 
+        async with CONVERSATION_LOCK:
+            state = CONVERSATIONS.setdefault(conversation_id, {"summary": "", "messages": []})
+            summary = state["summary"]
+            recent_messages = list(state["messages"])
+
+        system_prompt = _build_system_prompt(final_mode, task)
+        sources_block = ""
+        if final_mode in ("search", "local"):
+            heading = "WEB SOURCES:" if final_mode == "search" else "SOURCES:"
+            sources_block = _format_sources_block(context_blocks, heading)
+        user_payload = f"QUESTION:\n{req.question}"
+        if sources_block:
+            user_payload = f"{user_payload}\n\n{sources_block}"
+
+        prompt = _build_memory_prompt(system_prompt, summary, recent_messages, user_payload)
+        est_tokens = _estimate_tokens(prompt)
+
+        if est_tokens > MAX_CONTEXT_TOKENS and recent_messages:
+            summary_prompt = _build_summary_prompt(summary, recent_messages)
+            try:
+                new_summary = await _ollama_generate(summary_prompt, model)
+            except Exception:
+                new_summary = summary
+
+            pruned_messages = recent_messages[-(MAX_RECENT_TURNS * 2):]
+            async with CONVERSATION_LOCK:
+                state = CONVERSATIONS.setdefault(conversation_id, {"summary": "", "messages": []})
+                state["summary"] = new_summary
+                state["messages"] = pruned_messages
+            summary = new_summary
+            recent_messages = pruned_messages
+            prompt = _build_memory_prompt(system_prompt, summary, recent_messages, user_payload)
+
         meta = {
             "mode": final_mode,
             "task": task,
@@ -641,6 +747,7 @@ async def ask_stream(req: AskRequest):
         start_time = time.time()
         first_chunk_time = None
         token_count = 0
+        assistant_text = ""
         LLM_METRICS["context_chars"] = len(prompt or "")
         LLM_METRICS["last_updated"] = time.time()
         try:
@@ -648,6 +755,7 @@ async def ask_stream(req: AskRequest):
                 if first_chunk_time is None and chunk.strip():
                     first_chunk_time = time.time()
                 token_count += len(chunk.split())
+                assistant_text += chunk
 
                 yield f"event: chunk\ndata: {json.dumps(chunk)}\n\n"
         except httpx.ConnectError:
@@ -660,6 +768,12 @@ async def ask_stream(req: AskRequest):
                 LLM_METRICS["ttft_ms"] = round((first_chunk_time - start_time) * 1000)
                 LLM_METRICS["tokens_per_second"] = round(token_count / elapsed, 2)
                 LLM_METRICS["last_updated"] = time.time()
+
+        if assistant_text.strip():
+            async with CONVERSATION_LOCK:
+                state = CONVERSATIONS.setdefault(conversation_id, {"summary": "", "messages": []})
+                state["messages"].append({"role": "user", "content": req.question})
+                state["messages"].append({"role": "assistant", "content": assistant_text.strip()})
 
         yield "event: done\ndata: {}\n\n"
 
