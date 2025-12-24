@@ -22,11 +22,11 @@ import subprocess
 import time
 import re
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parents[1]  
+load_dotenv(BASE_DIR / ".env")
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "llama3.1:8b"
-BASE_DIR = Path(__file__).resolve().parent.parent 
 DOCS_DIR = BASE_DIR / "data" / "documents"
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_INTERVAL_SECONDS = 180 
@@ -34,6 +34,8 @@ WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small")
 VOSK_MODEL_PATH = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+INDEX_LOCK = asyncio.Lock()
+_METAL_CACHE = {"value": None, "ts": 0.0}
 _WHISPER_MODEL = None 
 _vosk_model = None
 
@@ -50,10 +52,6 @@ FORMAT_RULES = (
     "- Do not output stray asterisks. Bold must be exactly **like this**.\n"
 )
 
-BASE_DIR = Path(__file__).resolve().parents[1]  
-load_dotenv(BASE_DIR / ".env")
-
-INDEX_LOCK = asyncio.Lock()
 INDEX_STATUS = {
     "state": "idle",               
     "is_indexing": False,
@@ -71,7 +69,236 @@ LLM_METRICS = {
     "last_updated": None,
 }
 
-_METAL_CACHE = {"value": None, "ts": 0.0}
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(_index_daemon(stop_event))
+
+    try:
+        yield
+    finally:
+        stop_event.set()
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
+
+app = FastAPI(title="Local AI Backend", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class AskRequest(BaseModel):
+    question: str
+    mode: str = "local" 
+    model: str | None = None
+    top_k: int = 6
+    task: str | None = None   
+
+class RememberRequest(BaseModel):
+    content: str
+    source: str = "manual"
+
+async def _run_index_job(trigger: str):
+    if INDEX_LOCK.locked():
+        return False
+
+    async with INDEX_LOCK:
+        INDEX_STATUS["state"] = "running"
+        INDEX_STATUS["is_indexing"] = True
+        INDEX_STATUS["last_trigger"] = trigger
+        INDEX_STATUS["last_started_at"] = _now_iso()
+        INDEX_STATUS["last_error"] = None
+
+        try:
+            stats = await run_index()
+            INDEX_STATUS["stats"] = stats
+            INDEX_STATUS["state"] = "ok"
+        except Exception as e:
+            INDEX_STATUS["state"] = "error"
+            INDEX_STATUS["last_error"] = f"{type(e).__name__}: {str(e)}"
+        finally:
+            INDEX_STATUS["is_indexing"] = False
+            INDEX_STATUS["last_finished_at"] = _now_iso()
+
+    return True
+
+async def _index_daemon(stop_event: asyncio.Event):
+    await _run_index_job("startup")
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=INDEX_INTERVAL_SECONDS)
+        except asyncio.TimeoutError:
+            await _run_index_job("scheduled")
+
+async def brave_web_search(query: str, count: int = 5):
+    if not BRAVE_SEARCH_API_KEY:
+        raise HTTPException(status_code=500, detail="BRAVE_SEARCH_API_KEY not set in .env")
+
+    headers = {
+        "Accept": "application/json",
+        "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+    }
+
+    params = {
+        "q": query,
+        "count": count,
+        "search_lang": "en",
+        "safesearch": "moderate",
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(BRAVE_SEARCH_URL, headers=headers, params=params)
+        r.raise_for_status()
+        data = r.json()
+
+    results = []
+    web = (data or {}).get("web", {})
+    items = web.get("results", []) or []
+
+    for i, it in enumerate(items[:count]):
+        results.append({
+            "label": f"W{i+1}",
+            "title": it.get("title") or it.get("url") or f"Result {i+1}",
+            "url": it.get("url") or "",
+            "snippet": it.get("description") or "",
+        })
+
+    return results
+
+async def ollama_stream(prompt: str, model: str):
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": True, 
+        "options": {
+            "num_ctx": 4096,
+            "temperature": 0.6,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream("POST", f"{OLLAMA_BASE_URL}/api/generate", json=payload) as r:
+            r.raise_for_status()
+
+            async for line in r.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                chunk = obj.get("response", "")
+                if chunk:
+                    yield chunk
+
+                if obj.get("done"):
+                    break
+
+async def ollama_generate(prompt: str, model: str) -> str:
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False, 
+        "options": {
+            "num_ctx": 4096,
+            "temperature": 0.6,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("response", "")
+    
+async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -> tuple[str | None, list, dict]:
+    q_vec = (await embed_texts([question]))[0]
+
+    index = load_faiss_index()
+    if index is None:
+        return None, [], {"top_k": top_k, "best_score": 0.0}
+
+    k = top_k
+    if task == "summary":
+        k = max(k, 12)
+
+    scores, vector_ids = faiss_search(index, q_vec, top_k=k)
+    chunks = get_chunks_by_vector_ids(vector_ids)
+
+    if not chunks:
+        best = float(scores[0]) if scores else 0.0
+        top3 = [float(x) for x in (scores[:3] if scores else [])]
+        avg_top3 = sum(top3) / len(top3) if top3 else 0.0
+        gap = (float(scores[0]) - float(scores[1])) if scores and len(scores) > 1 else 0.0
+
+        return None, [], {"top_k": k, "best_score": best, "avg_top3": avg_top3, "score_gap": gap, "n_sources": 0}
+
+    context_blocks = []
+    sources = []
+    for i, ch in enumerate(chunks):
+        label = f"S{i+1}"
+        context_blocks.append(
+            f"[{label}] doc={ch['doc_path']} chunk={ch['chunk_index']}\n{ch['text']}"
+        )
+        src_score = scores[i] if i < len(scores) else None
+        sources.append({
+            "label": label,
+            "doc_path": ch["doc_path"],
+            "chunk_index": ch["chunk_index"],
+            "score": float(src_score) if src_score is not None else None,
+            # small preview for routing gate (and optional UI later)
+            "text_preview": (ch["text"] or "")[:500],
+        })
+
+    if task == "summary":
+        instructions = (
+            "TASK: Summarize using ONLY the provided SOURCES.\n"
+            "You MUST synthesize a summary even if the sources are split across chunks.\n"
+            "Do NOT say 'I don't know' just because a summary isn't explicitly written.\n"
+            "If important sections are missing, make a partial summary and say what seems missing.\n"
+            "Follow the user's format request (e.g. bullet points).\n"
+            "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
+            "Do NOT cite or mention source IDs or filenames in the answer.\n"
+        )
+    else:
+        instructions = (
+            "TASK: Answer using ONLY the provided SOURCES.\n"
+            "If the answer cannot be found in the sources, say 'I don't know'.\n"
+            "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
+            "Do NOT cite or mention source IDs or filenames in the answer.\n"
+        )
+
+    prompt = (
+        "You are a local, privacy-first assistant.\n\n"
+        f"QUESTION:\n{question}\n\n"
+        "SOURCES:\n" + "\n\n".join(context_blocks) + "\n\n"
+        f"{instructions}"
+        f"{FORMAT_RULES}\n"
+    )
+
+    best = float(scores[0]) if scores else 0.0
+    top3 = [float(x) for x in (scores[:3] if scores else [])]
+    avg_top3 = sum(top3) / len(top3) if top3 else 0.0
+    gap = (float(scores[0]) - float(scores[1])) if scores and len(scores) > 1 else 0.0
+
+    return prompt, sources, {
+        "top_k": k,
+        "best_score": best,
+        "avg_top3": avg_top3,
+        "score_gap": gap,
+        "n_sources": len(sources),
+    }
 
 def _run_cmd(cmd: list[str], timeout: float = 1.5) -> str | None:
     try:
@@ -170,41 +397,6 @@ def _get_metal_status() -> bool | None:
     _METAL_CACHE["ts"] = now
     return supported
 
-async def brave_web_search(query: str, count: int = 5):
-    if not BRAVE_SEARCH_API_KEY:
-        raise HTTPException(status_code=500, detail="BRAVE_SEARCH_API_KEY not set in .env")
-
-    headers = {
-        "Accept": "application/json",
-        "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
-    }
-
-    params = {
-        "q": query,
-        "count": count,
-        "search_lang": "en",
-        "safesearch": "moderate",
-    }
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(BRAVE_SEARCH_URL, headers=headers, params=params)
-        r.raise_for_status()
-        data = r.json()
-
-    results = []
-    web = (data or {}).get("web", {})
-    items = web.get("results", []) or []
-
-    for i, it in enumerate(items[:count]):
-        results.append({
-            "label": f"W{i+1}",
-            "title": it.get("title") or it.get("url") or f"Result {i+1}",
-            "url": it.get("url") or "",
-            "snippet": it.get("description") or "",
-        })
-
-    return results
-
 def build_web_prompt(question: str, results: list[dict]) -> str:
     blocks = []
     for r in results:
@@ -251,77 +443,6 @@ def _get_whisper_model():
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-async def _run_index_job(trigger: str):
-    if INDEX_LOCK.locked():
-        return False
-
-    async with INDEX_LOCK:
-        INDEX_STATUS["state"] = "running"
-        INDEX_STATUS["is_indexing"] = True
-        INDEX_STATUS["last_trigger"] = trigger
-        INDEX_STATUS["last_started_at"] = _now_iso()
-        INDEX_STATUS["last_error"] = None
-
-        try:
-            stats = await run_index()
-            INDEX_STATUS["stats"] = stats
-            INDEX_STATUS["state"] = "ok"
-        except Exception as e:
-            INDEX_STATUS["state"] = "error"
-            INDEX_STATUS["last_error"] = f"{type(e).__name__}: {str(e)}"
-        finally:
-            INDEX_STATUS["is_indexing"] = False
-            INDEX_STATUS["last_finished_at"] = _now_iso()
-
-    return True
-
-async def _index_daemon(stop_event: asyncio.Event):
-    await _run_index_job("startup")
-
-    while not stop_event.is_set():
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=INDEX_INTERVAL_SECONDS)
-        except asyncio.TimeoutError:
-            await _run_index_job("scheduled")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-
-    stop_event = asyncio.Event()
-    task = asyncio.create_task(_index_daemon(stop_event))
-
-    try:
-        yield
-    finally:
-        stop_event.set()
-        task.cancel()
-        try:
-            await task
-        except Exception:
-            pass
-
-app = FastAPI(title="Local AI Backend", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class AskRequest(BaseModel):
-    question: str
-    mode: str = "local" 
-    model: str | None = None
-    top_k: int = 6
-    task: str | None = None   
-
-class RememberRequest(BaseModel):
-    content: str
-    source: str = "manual"
-
 def infer_task(question: str) -> str:
     q = question.lower()
     summary_keywords = ["summarize", "summary", "overview", "bullet", "bullets", "tl;dr", "high level"]
@@ -335,54 +456,6 @@ def should_fallback_to_general(vector_ids: list[int], scores: list[float]) -> bo
     best = scores[0] if scores else 0.0
     return best < 0.38  
 
-async def ollama_stream(prompt: str, model: str):
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": True, 
-        "options": {
-            "num_ctx": 4096,
-            "temperature": 0.6,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", f"{OLLAMA_BASE_URL}/api/generate", json=payload) as r:
-            r.raise_for_status()
-
-            async for line in r.aiter_lines():
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                # Ollama streams partial text in `response`
-                chunk = obj.get("response", "")
-                if chunk:
-                    yield chunk
-
-                if obj.get("done"):
-                    break
-
-async def ollama_generate(prompt: str, model: str) -> str:
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False, 
-        "options": {
-            "num_ctx": 4096,
-            "temperature": 0.6,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("response", "")
-
 def load_faiss_index():
     idx_path = Path(__file__).parent / "vector_index" / "index.faiss"
     if not idx_path.exists():
@@ -391,84 +464,6 @@ def load_faiss_index():
     if not isinstance(idx, faiss.IndexIDMap2):
         idx = faiss.IndexIDMap2(idx)
     return idx
-
-async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -> tuple[str | None, list, dict]:
-    q_vec = (await embed_texts([question]))[0]
-
-    index = load_faiss_index()
-    if index is None:
-        return None, [], {"top_k": top_k, "best_score": 0.0}
-
-    k = top_k
-    if task == "summary":
-        k = max(k, 12)
-
-    scores, vector_ids = faiss_search(index, q_vec, top_k=k)
-    chunks = get_chunks_by_vector_ids(vector_ids)
-
-    if not chunks:
-        best = float(scores[0]) if scores else 0.0
-        top3 = [float(x) for x in (scores[:3] if scores else [])]
-        avg_top3 = sum(top3) / len(top3) if top3 else 0.0
-        gap = (float(scores[0]) - float(scores[1])) if scores and len(scores) > 1 else 0.0
-
-        return None, [], {"top_k": k, "best_score": best, "avg_top3": avg_top3, "score_gap": gap, "n_sources": 0}
-
-    context_blocks = []
-    sources = []
-    for i, ch in enumerate(chunks):
-        label = f"S{i+1}"
-        context_blocks.append(
-            f"[{label}] doc={ch['doc_path']} chunk={ch['chunk_index']}\n{ch['text']}"
-        )
-        src_score = scores[i] if i < len(scores) else None
-        sources.append({
-            "label": label,
-            "doc_path": ch["doc_path"],
-            "chunk_index": ch["chunk_index"],
-            "score": float(src_score) if src_score is not None else None,
-            # small preview for routing gate (and optional UI later)
-            "text_preview": (ch["text"] or "")[:500],
-        })
-
-    if task == "summary":
-        instructions = (
-            "TASK: Summarize using ONLY the provided SOURCES.\n"
-            "You MUST synthesize a summary even if the sources are split across chunks.\n"
-            "Do NOT say 'I don't know' just because a summary isn't explicitly written.\n"
-            "If important sections are missing, make a partial summary and say what seems missing.\n"
-            "Follow the user's format request (e.g. bullet points).\n"
-            "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
-            "Do NOT cite or mention source IDs or filenames in the answer.\n"
-        )
-    else:
-        instructions = (
-            "TASK: Answer using ONLY the provided SOURCES.\n"
-            "If the answer cannot be found in the sources, say 'I don't know'.\n"
-            "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
-            "Do NOT cite or mention source IDs or filenames in the answer.\n"
-        )
-
-    prompt = (
-        "You are a local, privacy-first assistant.\n\n"
-        f"QUESTION:\n{question}\n\n"
-        "SOURCES:\n" + "\n\n".join(context_blocks) + "\n\n"
-        f"{instructions}"
-        f"{FORMAT_RULES}\n"
-    )
-
-    best = float(scores[0]) if scores else 0.0
-    top3 = [float(x) for x in (scores[:3] if scores else [])]
-    avg_top3 = sum(top3) / len(top3) if top3 else 0.0
-    gap = (float(scores[0]) - float(scores[1])) if scores and len(scores) > 1 else 0.0
-
-    return prompt, sources, {
-        "top_k": k,
-        "best_score": best,
-        "avg_top3": avg_top3,
-        "score_gap": gap,
-        "n_sources": len(sources),
-    }
 
 @app.get("/health")
 def health():
@@ -503,6 +498,30 @@ def metrics():
         "backend": "Ollama",
     },
     }
+
+@app.get("/docs/list")
+def docs_list():
+    items = []
+    for p in sorted(DOCS_DIR.glob("*")):
+        if not p.is_file():
+            continue
+
+        st = p.stat()
+        items.append({
+            "name": p.name,
+            "path": str(p),
+            "size": st.st_size,
+            "modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+        })
+    return {"docs": items}
+
+@app.get("/index/status")
+def index_status():
+    return INDEX_STATUS
+
+@app.get("/memory/search")
+def memory_search(q: str, limit: int = 10):
+    return {"results": search_memory(q, limit)}
 
 @app.post("/voice/transcribe")
 async def voice_transcribe(file: UploadFile = File(...)):
@@ -550,22 +569,6 @@ async def voice_transcribe(file: UploadFile = File(...)):
 
     return {"text": text}
 
-@app.get("/docs/list")
-def docs_list():
-    items = []
-    for p in sorted(DOCS_DIR.glob("*")):
-        if not p.is_file():
-            continue
-
-        st = p.stat()
-        items.append({
-            "name": p.name,
-            "path": str(p),
-            "size": st.st_size,
-            "modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
-        })
-    return {"docs": items}
-
 @app.post("/docs/upload")
 async def docs_upload(file: UploadFile = File(...)):
     filename = os.path.basename(file.filename or "upload.bin")
@@ -592,10 +595,6 @@ async def docs_upload(file: UploadFile = File(...)):
 
     return {"ok": True, "saved_as": dest.name, "path": str(dest)}
 
-@app.get("/index/status")
-def index_status():
-    return INDEX_STATUS
-
 @app.post("/index/run")
 async def index_run():
     if INDEX_LOCK.locked():
@@ -608,10 +607,6 @@ async def index_run():
 def remember(req: RememberRequest):
     mem_id = add_memory(req.content, req.source)
     return {"ok": True, "id": mem_id}
-
-@app.get("/memory/search")
-def memory_search(q: str, limit: int = 10):
-    return {"results": search_memory(q, limit)}
 
 @app.post("/ask")
 async def ask(req: AskRequest):
@@ -877,7 +872,7 @@ async def voice_stt_ws(ws: WebSocket):
             else:
                 pres = json.loads(recognizer.PartialResult())
                 p = (pres.get("partial") or "").strip()
-                # evita spamear si no cambió
+           
                 if p and p != partial_last:
                     partial_last = p
                     await ws.send_json({"type": "partial", "text": p})
