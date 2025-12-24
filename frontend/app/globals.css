@@ -5,22 +5,25 @@ html,
 body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: #0b0b0f;
-  color: #e5e7eb;
+  background-color: #000000;
+  color: #d2f1ef;
   overscroll-behavior: none;
   overscroll-behavior-y: none;
   min-height: 100%;
   height: 100%;
   width: 100%;
+  font-family: var(--font-space-grotesk), "Segoe UI", sans-serif;
 }
 
 body {
   overflow: hidden;
+  background-image:
+    radial-gradient(circle at 50% 50%, rgba(18, 80, 110, 0.22), transparent 55%);
 }
 
 #__next {
   min-height: 100%;
-  background-color: #0b0b0f;
+  background-color: #000000;
 }
 
 .app-shell {
@@ -28,6 +31,73 @@ body {
   height: 100vh;
   overflow-y: auto;
   overscroll-behavior: none;
+}
+
+.font-display {
+  font-family: var(--font-oxanium), "Segoe UI", sans-serif;
+  letter-spacing: 0.02em;
+}
+
+.font-mono {
+  font-family: var(--font-share-tech-mono), "SFMono-Regular", monospace;
+}
+
+.glass-panel {
+  background: transparent;
+  border: 1px solid rgba(60, 190, 210, 0.22);
+  box-shadow: none;
+  backdrop-filter: blur(16px);
+}
+
+.glass-panel--thin {
+  background: transparent;
+  border-color: rgba(70, 200, 220, 0.2);
+  box-shadow: none;
+}
+
+.glass-panel--menu {
+  background: rgba(3, 7, 10, 0.72);
+  border-color: rgba(70, 200, 220, 0.22);
+}
+
+.glass-panel--input {
+  background: transparent;
+  border-color: rgba(70, 200, 220, 0.22);
+}
+
+.neon-edge {
+  box-shadow: none;
+}
+
+.message-shell {
+  border: 1px solid rgba(62, 170, 200, 0.2);
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: blur(14px);
+}
+
+.message-user {
+  background: transparent;
+  border-color: rgba(70, 200, 220, 0.28);
+}
+
+.message-ai {
+  background: transparent;
+  border-color: rgba(40, 140, 170, 0.26);
+}
+
+.scan-grid {
+  background-image:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(0deg, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
+  background-size: 140px 140px;
+}
+
+.scanlines {
+  background-image: linear-gradient(0deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0) 40%);
+  background-size: 100% 6px;
+  mix-blend-mode: screen;
+  opacity: 0.08;
 }
 
 @keyframes auroraFlow {
@@ -117,22 +187,22 @@ body {
 @keyframes jarvisGlow {
   0% {
     background-position: 0% 50%;
-    text-shadow: 0 0 12px rgba(56, 189, 248, 0.35);
+    text-shadow: 0 0 14px rgba(32, 194, 170, 0.4);
   }
 
   50% {
     background-position: 100% 50%;
-    text-shadow: 0 0 18px rgba(94, 234, 212, 0.45);
+    text-shadow: 0 0 18px rgba(38, 173, 162, 0.55);
   }
 
   100% {
     background-position: 0% 50%;
-    text-shadow: 0 0 12px rgba(56, 189, 248, 0.35);
+    text-shadow: 0 0 14px rgba(32, 194, 170, 0.4);
   }
 }
 
 .jarvis-anim {
-  background-image: linear-gradient(90deg, #e0f2fe, #67e8f9, #38bdf8, #e0f2fe);
+  background-image: linear-gradient(90deg, #d2f7f2, #72e2d2, #32b7a7, #d2f7f2);
   background-size: 250% 250%;
   background-clip: text;
   -webkit-background-clip: text;
@@ -141,6 +211,7 @@ body {
 }
 
 @keyframes dotPulse {
+
   0%,
   100% {
     transform: translateY(0);
@@ -163,7 +234,7 @@ body {
   width: 6px;
   height: 6px;
   border-radius: 999px;
-  background: #67e8f9;
+  background: #32b7a7;
   animation: dotPulse 1s ease-in-out infinite;
 }
 
@@ -193,7 +264,7 @@ body {
   width: 60px;
   height: 60px;
   position: relative;
-  filter: drop-shadow(0 10px 35px rgba(56, 189, 248, 0.2));
+  filter: none;
 }
 
 .orb {
@@ -201,15 +272,12 @@ body {
   height: 100%;
   border-radius: 50%;
   background:
-    radial-gradient(circle at 28% 28%, #e8f7ff, #99e1ff 30%, #3aa3e4 52%, #1f5f91 70%, #0f2236 88%),
-    radial-gradient(circle at 74% 34%, rgba(255, 181, 132, 0.6), transparent 50%),
-    radial-gradient(circle at 34% 76%, rgba(202, 138, 255, 0.45), transparent 50%),
-    radial-gradient(circle at 68% 72%, rgba(74, 222, 128, 0.45), transparent 55%),
-    radial-gradient(circle at 52% 48%, rgba(248, 113, 113, 0.35), transparent 65%);
-  box-shadow:
-    inset 0 0 30px rgba(255, 255, 255, 0.12),
-    0 0 25px rgba(56, 189, 248, 0.35),
-    0 0 30px rgba(59, 130, 246, 0.25);
+    radial-gradient(circle at 28% 28%, #d8fbf4, #7ee6d6 30%, #2fb6a5 55%, #123a34 74%, #0a1514 92%),
+    radial-gradient(circle at 74% 34%, rgba(60, 220, 198, 0.65), transparent 55%),
+    radial-gradient(circle at 34% 76%, rgba(36, 160, 146, 0.55), transparent 55%),
+    radial-gradient(circle at 68% 72%, rgba(64, 224, 208, 0.4), transparent 55%),
+    radial-gradient(circle at 52% 48%, rgba(45, 212, 191, 0.3), transparent 65%);
+  box-shadow: none;
   animation: none;
   position: relative;
   overflow: hidden;
@@ -220,10 +288,10 @@ body {
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  background: radial-gradient(circle at 70% 30%, rgba(255, 255, 255, 0.4), transparent 45%),
-    radial-gradient(circle at 28% 70%, rgba(14, 165, 233, 0.3), transparent 55%),
-    radial-gradient(circle at 50% 55%, rgba(248, 113, 113, 0.24), transparent 60%),
-    radial-gradient(circle at 65% 65%, rgba(94, 234, 212, 0.28), transparent 60%);
+  background: radial-gradient(circle at 70% 30%, rgba(255, 255, 255, 0.35), transparent 45%),
+    radial-gradient(circle at 28% 70%, rgba(32, 194, 170, 0.35), transparent 55%),
+    radial-gradient(circle at 50% 55%, rgba(38, 173, 162, 0.28), transparent 60%),
+    radial-gradient(circle at 65% 65%, rgba(64, 224, 208, 0.28), transparent 60%);
   mix-blend-mode: screen;
 }
 
@@ -294,11 +362,11 @@ body {
 }
 
 .inner-anim::before {
-  background: radial-gradient(circle at 30% 30%, rgba(255, 180, 120, 0.8), rgba(61, 130, 244, 0.5), rgba(109, 40, 217, 0.6));
+  background: radial-gradient(circle at 30% 30%, rgba(100, 240, 220, 0.85), rgba(32, 194, 170, 0.6), rgba(16, 118, 110, 0.65));
   animation: orbFlowA 10s ease-in-out infinite;
 }
 
 .inner-anim::after {
-  background: radial-gradient(circle at 60% 60%, rgba(59, 130, 246, 0.8), rgba(45, 212, 191, 0.6), rgba(236, 72, 153, 0.5));
+  background: radial-gradient(circle at 60% 60%, rgba(60, 220, 198, 0.8), rgba(32, 194, 170, 0.6), rgba(20, 130, 120, 0.55));
   animation: orbFlowB 12s ease-in-out infinite;
 }

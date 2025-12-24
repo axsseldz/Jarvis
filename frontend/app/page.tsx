@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -193,6 +194,8 @@ export default function Page() {
   const [micError, setMicError] = useState("");
   const [showModeMenu, setShowModeMenu] = useState(false);
   const [showDocsMenu, setShowDocsMenu] = useState(false);
+  const [docsMenuPos, setDocsMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [modeMenuPos, setModeMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
 
   const spokenRef = useRef<string>(""); // avoid double-speaking
@@ -200,6 +203,8 @@ export default function Page() {
   const chatRef = useRef<HTMLDivElement | null>(null);
   const modeMenuRef = useRef<HTMLDivElement | null>(null);
   const docsMenuRef = useRef<HTMLDivElement | null>(null);
+  const docsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const modeButtonRef = useRef<HTMLButtonElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -218,6 +223,57 @@ export default function Page() {
     });
     return () => cancelAnimationFrame(id);
   }, [messages]);
+
+  useEffect(() => {
+    if (!showDocsMenu) {
+      setDocsMenuPos(null);
+      return;
+    }
+
+    const updatePos = () => {
+      const btn = docsButtonRef.current;
+      if (!btn || typeof window === "undefined") return;
+      const rect = btn.getBoundingClientRect();
+      const menuWidth = 224;
+      const left = Math.max(8, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 8));
+      const top = rect.bottom + 8;
+      setDocsMenuPos({ top, left });
+    };
+
+    updatePos();
+    window.addEventListener("resize", updatePos);
+    window.addEventListener("scroll", updatePos, true);
+    return () => {
+      window.removeEventListener("resize", updatePos);
+      window.removeEventListener("scroll", updatePos, true);
+    };
+  }, [showDocsMenu]);
+
+  useEffect(() => {
+    if (!showModeMenu) {
+      setModeMenuPos(null);
+      return;
+    }
+
+    const updatePos = () => {
+      const btn = modeButtonRef.current;
+      if (!btn || typeof window === "undefined") return;
+      const rect = btn.getBoundingClientRect();
+      const menuWidth = 240;
+      const menuHeight = 176;
+      const left = Math.max(8, Math.min(rect.left, window.innerWidth - menuWidth - 8));
+      const top = Math.max(8, rect.top - menuHeight - 8);
+      setModeMenuPos({ top, left });
+    };
+
+    updatePos();
+    window.addEventListener("resize", updatePos);
+    window.addEventListener("scroll", updatePos, true);
+    return () => {
+      window.removeEventListener("resize", updatePos);
+      window.removeEventListener("scroll", updatePos, true);
+    };
+  }, [showModeMenu]);
 
   useEffect(() => {
     if (!showModeMenu && !showDocsMenu) return;
@@ -761,7 +817,7 @@ export default function Page() {
         href={href || "#"}
         target="_blank"
         rel="noreferrer"
-        className="text-cyan-300 hover:text-cyan-200 underline underline-offset-4"
+        className="text-emerald-300 hover:text-teal-200 underline underline-offset-4"
       >
         {children}
       </a>
@@ -785,7 +841,7 @@ export default function Page() {
       if (!isBlock) {
         return (
           <code
-            className="rounded-md border border-slate-800/70 bg-slate-950/60 px-1.5 py-0.5 text-[0.9em] text-slate-100"
+            className="rounded-md border border-slate-800/70 bg-slate-950/60 px-1.5 py-0.5 text-[0.9em] text-slate-100 font-mono"
             {...props}
           >
             {children}
@@ -799,7 +855,7 @@ export default function Page() {
       );
     },
     pre: ({ children }) => (
-      <pre className="my-4 overflow-x-auto rounded-2xl border border-slate-800/70 bg-[#0b111a] p-4 text-sm leading-relaxed text-slate-100 shadow-[0_12px_40px_rgba(0,0,0,0.35)]">
+      <pre className="my-4 overflow-x-auto rounded-2xl border border-slate-800/70 bg-[#0b111a] p-4 text-sm leading-relaxed text-slate-100 font-mono">
         {children}
       </pre>
     ),
@@ -855,10 +911,10 @@ export default function Page() {
   const controlButtonBase =
     "relative overflow-hidden rounded-xl border px-3 py-1.5 text-xs font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-[1px]";
   const controlButtonActive =
-    "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-cyan-400/60 hover:bg-cyan-500/10 hover:shadow-[0_12px_45px_rgba(34,211,238,0.18)] active:scale-[0.98] active:border-cyan-300/70 active:bg-cyan-500/15 cursor-pointer";
-  const controlButtonDisabled = "border-slate-800/70 bg-slate-950/30 text-slate-500 cursor-not-allowed shadow-none";
+    "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-emerald-300/60 hover:bg-emerald-500/10 active:scale-[0.98] active:border-teal-300/70 active:bg-teal-500/15 cursor-pointer";
+  const controlButtonDisabled = "border-slate-800/70 bg-slate-950/30 text-slate-500 cursor-not-allowed";
   const copyButtonClass =
-    "group inline-flex items-center gap-1.5 rounded-xl border border-slate-800/70 bg-slate-950/50 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-cyan-400/50 hover:bg-cyan-500/10 hover:text-cyan-100 active:translate-y-[1px] active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500/40";
+    "group inline-flex items-center gap-1.5 rounded-xl border border-slate-800/70 bg-slate-950/50 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-emerald-300/60 hover:bg-emerald-500/10 hover:text-emerald-100 active:translate-y-[1px] active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/40";
   const modeLabels: Record<Mode, string> = {
     local: "Local",
     general: "General",
@@ -895,53 +951,40 @@ export default function Page() {
 
   return (
     <div
-      className="app-shell relative min-h-screen bg-[#0d1218] text-slate-100 overflow-y-scroll flex flex-col"
+      className="app-shell relative min-h-screen text-slate-100 overflow-y-scroll flex flex-col"
       style={{ scrollbarGutter: "stable" }}
     >
       <div className="pointer-events-none fixed inset-0 overflow-hidden">
-        <div className="absolute -top-32 -left-32 w-130 rounded-full blur-3xl opacity-22 bg-linear-to-r from-[#113042] via-[#0f2330] to-[#0b141e]" />
-        <div className="absolute -bottom-40 -right-40 h-155 w-155 rounded-full blur-3xl opacity-16 bg-linear-to-r from-[#0c1a26] via-[#0a131c] to-[#05090f]" />
-        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(255,255,255,0.015),transparent_60%)]" />
-        <div className="absolute inset-0 opacity-[0.06] bg-[radial-gradient(circle_at_20%_20%,rgba(45,212,191,0.1),transparent_25%),radial-gradient(circle_at_80%_12%,rgba(125,211,252,0.1),transparent_22%),radial-gradient(circle_at_40%_78%,rgba(94,234,212,0.1),transparent_28%)]" />
-        <div className="absolute inset-0 opacity-[0.03] bg-[linear-gradient(90deg,rgba(255,255,255,0.08)_1px,transparent_1px),linear-gradient(0deg,rgba(255,255,255,0.08)_1px,transparent_1px)] bg-size-[120px_120px]" />
+        <div className="absolute -top-40 -left-40 h-120 w-120 rounded-full blur-3xl opacity-35 bg-linear-to-r from-[#0f2a24] via-[#0c1f1c] to-transparent" />
+        <div className="absolute -bottom-40 -right-40 h-160 w-160 rounded-full blur-3xl opacity-35 bg-linear-to-r from-[#0d2420] via-[#0a1a18] to-transparent" />
+        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(255,255,255,0.02),transparent_60%)]" />
+        <div className="absolute inset-0 opacity-[0.1] bg-[radial-gradient(circle_at_20%_15%,rgba(45,212,191,0.2),transparent_30%),radial-gradient(circle_at_85%_10%,rgba(32,194,170,0.2),transparent_28%),radial-gradient(circle_at_40%_78%,rgba(20,130,120,0.2),transparent_30%)]" />
+        <div className="absolute inset-0 opacity-[0.06] scan-grid" />
+        <div className="absolute inset-0 scanlines" />
       </div>
 
-      <div className="absolute top-4 left-4 z-20 flex items-center gap-3">
-        <div className="orb-container static-orb w-8 h-8">
-          <div className="orb inner-anim" />
-        </div>
-        <div className="flex flex-col">
-          <motion.div
-            initial={{ opacity: 0, y: -6 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.8, ease: "easeOut" }}
-            className="text-2xl font-semibold jarvis-anim leading-tight"
-          >
-            Jarvis
-          </motion.div>
-          <p className="text-xs text-slate-400">Local + General + Search</p>
-        </div>
-      </div>
+      <div className="absolute top-4 left-4 z-20" />
 
-      <div className="absolute top-4 right-4 z-20">
-        <div className="inline-flex flex-col items-stretch gap-2">
-          <div className="inline-flex items-center gap-2 rounded-2xl border border-slate-800/60 bg-slate-950/40 px-2.5 py-1.5 text-[11px] text-slate-300 shadow-sm">
+      <div className="absolute top-4 right-4 z-30 isolate">
+        <div className="inline-flex flex-col items-stretch gap-2 bg-transparent">
+          <div className="inline-flex items-center gap-2 rounded-2xl px-2.5 py-1.5 text-[11px] text-slate-300 glass-panel glass-panel--thin neon-edge">
             {/* Docs dropdown */}
-            <div className="relative" ref={docsMenuRef}>
+            <div className="relative z-50" ref={docsMenuRef}>
               <button
                 type="button"
                 onClick={() => setShowDocsMenu((v) => !v)}
+                ref={docsButtonRef}
                 className={cx(
-                  "inline-flex items-center gap-2 rounded-lg border bg-slate-950/30 px-2 py-1 text-[11px] font-semibold text-slate-200 transition",
+                  "inline-flex items-center gap-2 rounded-lg border bg-transparent px-2 py-1 text-[11px] font-semibold text-slate-200 transition",
                   showDocsMenu
-                    ? "border-cyan-400/60 bg-cyan-500/10 text-cyan-100"
-                    : "border-slate-800/70 hover:border-cyan-400/50 hover:text-cyan-100"
+                    ? "border-emerald-400/60 bg-emerald-500/15 text-emerald-100"
+                    : "border-slate-800/70 hover:border-emerald-300/60 hover:text-emerald-100"
                 )}
                 title="Documents in data/documents"
               >
                 <span className="max-w-[120px] truncate">{docsButtonLabel}</span>
                 <svg
-                  className={cx("h-3 w-3 text-cyan-200 transition-transform", showDocsMenu && "rotate-180")}
+                  className={cx("h-3 w-3 text-emerald-200 transition-transform", showDocsMenu && "rotate-180")}
                   viewBox="0 0 24 24"
                   fill="none"
                   stroke="currentColor"
@@ -953,11 +996,15 @@ export default function Page() {
                   <path d="M6 9l6 6 6-6" />
                 </svg>
               </button>
-
-              {showDocsMenu && (
-                <div className="absolute right-0 top-full mt-2 w-56 overflow-hidden rounded-xl border border-slate-800/70 bg-[#0e141c] shadow-[0_20px_60px_rgba(0,0,0,0.45)]">
+            </div>
+            {showDocsMenu && docsMenuPos
+              ? createPortal(
+                <div
+                  className="fixed z-[9999] w-56 overflow-hidden rounded-xl glass-panel glass-panel--menu"
+                  style={{ top: docsMenuPos.top, left: docsMenuPos.left }}
+                >
                   <div className="px-3 py-2 text-[11px] uppercase tracking-[0.35em] text-slate-400">
-                    Files
+                    Documents
                   </div>
                   <div className="max-h-56 overflow-y-auto hide-scrollbar">
                     {docs.length === 0 ? (
@@ -975,13 +1022,14 @@ export default function Page() {
                       ))
                     )}
                   </div>
-                </div>
-              )}
-            </div>
+                </div>,
+                document.body
+              )
+              : null}
 
             {/* Upload (file picker) */}
             <label
-              className="rounded-lg border border-slate-800/70 bg-slate-950/30 px-2 py-1 text-[11px] font-semibold text-slate-200 transition hover:border-cyan-400/50 hover:text-cyan-100"
+              className="rounded-lg border border-slate-800/70 bg-transparent px-2 py-1 text-[11px] font-semibold text-slate-200 transition hover:border-emerald-300/60 hover:text-emerald-100"
               title="Upload a document into data/documents and auto-index"
             >
               <span className="inline-flex items-center gap-1.5">
@@ -1020,8 +1068,8 @@ export default function Page() {
               className={cx(
                 "rounded-lg border px-2 py-1 text-[11px] font-semibold transition",
                 indexStatus?.is_indexing || indexStarting
-                  ? "border-slate-800/70 bg-slate-950/30 text-slate-500 cursor-not-allowed"
-                  : "border-slate-800/70 bg-slate-950/30 text-slate-200 hover:border-cyan-400/50 hover:text-cyan-100"
+                  ? "border-slate-800/70 bg-transparent text-slate-500 cursor-not-allowed"
+                  : "border-slate-800/70 bg-transparent text-slate-200 hover:border-emerald-300/60 hover:text-emerald-100"
               )}
               title="Run indexing now"
             >
@@ -1046,14 +1094,14 @@ export default function Page() {
             </button>
           </div>
 
-          <div className="w-full rounded-2xl border border-slate-800/70 bg-slate-950/40 px-3 py-2">
+          <div className="relative z-0 w-full rounded-2xl px-3 py-2 glass-panel neon-edge">
             <div className="flex items-center justify-between gap-3 text-[11px] font-semibold text-slate-200">
               <span>Index status</span>
               <span
                 className={cx(
                   "rounded-full px-2 py-0.5 text-[11px]",
-                  indexStatus?.state === "running" && "bg-cyan-500/15 text-cyan-200",
-                  indexStatus?.state === "ok" && "bg-emerald-500/15 text-emerald-200",
+                  indexStatus?.state === "running" && "bg-emerald-500/15 text-emerald-200",
+                  indexStatus?.state === "ok" && "bg-teal-500/15 text-teal-200",
                   indexStatus?.state === "error" && "bg-rose-500/15 text-rose-200",
                   (!indexStatus || indexStatus?.state === "idle") && "bg-slate-700/30 text-slate-300"
                 )}
@@ -1066,14 +1114,14 @@ export default function Page() {
               {indexStatus?.is_indexing ? (
                 indexProgress !== null ? (
                   <div
-                    className="h-full bg-linear-to-r from-cyan-500 via-cyan-300 to-emerald-400 transition-[width] duration-300 index-bar"
+                    className="h-full bg-linear-to-r from-emerald-500 via-teal-400 to-cyan-400 transition-[width] duration-300 index-bar"
                     style={{ width: `${indexProgress}%` }}
                   />
                 ) : (
-                  <div className="h-full w-2/5 bg-linear-to-r from-cyan-500 via-cyan-300 to-emerald-400 index-bar-indeterminate" />
+                  <div className="h-full w-2/5 bg-linear-to-r from-emerald-500 via-teal-400 to-cyan-400 index-bar-indeterminate" />
                 )
               ) : (
-                <div className="h-full w-full bg-linear-to-r from-cyan-500/40 to-emerald-400/40" />
+                <div className="h-full w-full bg-linear-to-r from-emerald-500/40 to-teal-400/40" />
               )}
             </div>
 
@@ -1086,10 +1134,10 @@ export default function Page() {
             </div>
           </div>
 
-          <div className="w-full rounded-2xl border border-slate-800/70 bg-slate-950/40 px-3 py-2">
+          <div className="relative z-0 w-full rounded-2xl px-3 py-2 glass-panel neon-edge">
             <div className="flex items-center justify-between gap-3 text-[11px] font-semibold text-slate-200">
               <span>LLM Resource Monitor</span>
-              <span className="rounded-full bg-slate-700/30 px-2 py-0.5 text-[10px] text-slate-300">
+              <span className="rounded-full bg-slate-700/30 px-2 py-0.5 text-[10px] text-slate-200">
                 Live
               </span>
             </div>
@@ -1193,7 +1241,7 @@ export default function Page() {
               initial={{ opacity: 0, y: -8 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -8 }}
-              className="rounded-2xl border border-red-900/50 bg-red-950/30 p-4 text-sm text-red-300 backdrop-blur"
+              className="rounded-2xl border border-red-900/50 bg-red-950/30 p-4 text-sm text-red-300 backdrop-blur glass-panel"
             >
               {error}
             </motion.div>
@@ -1230,10 +1278,10 @@ export default function Page() {
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 10 }}
                     className={cx(
-                      "rounded-3xl overflow-hidden",
+                      "rounded-3xl overflow-hidden message-shell",
                       m.role === "user"
-                        ? "ml-auto bg-linear-to-r"
-                        : "mr-auto bg-linear-to-r"
+                        ? "ml-auto message-user"
+                        : "mr-auto message-ai"
                     )}
                   >
                     <div className="p-4 flex items-center justify-between">
@@ -1242,7 +1290,7 @@ export default function Page() {
                           className={cx(
                             "h-2.5 w-2.5 rounded-full",
                             m.role === "user"
-                              ? "bg-linear-to-r from-emerald-300 to-cyan-400"
+                              ? "bg-linear-to-r from-sky-300 to-violet-300"
                               : "bg-linear-to-r from-slate-300 to-slate-500"
                           )}
                         />
@@ -1269,7 +1317,7 @@ export default function Page() {
                               <span className="loading-dot" />
                               <span className="loading-dot" />
                             </div>
-                            <span className="text-[11px] uppercase tracking-[0.3em] text-cyan-200/70">
+                            <span className="text-[11px] uppercase tracking-[0.3em] text-emerald-200/70">
                               Loading
                             </span>
                           </div>
@@ -1312,13 +1360,13 @@ export default function Page() {
                                   const isBlock = typeof className === "string" && className.includes("language-");
                                   if (!isBlock) {
                                     return (
-                                      <code className="rounded-md bg-white/5 px-1.5 py-0.5 text-[0.95em]" {...props}>
+                                      <code className="rounded-md bg-white/5 px-1.5 py-0.5 text-[0.95em] font-mono" {...props}>
                                         {children}
                                       </code>
                                     );
                                   }
                                   return (
-                                    <pre className="my-4 overflow-x-auto rounded-xl bg-black/40 p-4 text-sm border border-white/10">
+                                    <pre className="my-4 overflow-x-auto rounded-xl bg-black/40 p-4 text-sm border border-white/10 font-mono">
                                       <code className={className} {...props}>
                                         {children}
                                       </code>
@@ -1341,7 +1389,7 @@ export default function Page() {
                       {m.role === "assistant" && m.sources && m.sources.length > 0 && (
                         <div className="mt-5">
                           <details className="group">
-                            <summary className="cursor-pointer list-none flex items-center justify-between rounded-2xl border border-slate-800/60 bg-slate-950/50 px-4 py-3 hover:bg-slate-950/70 transition">
+                            <summary className="cursor-pointer list-none flex items-center justify-between rounded-2xl border border-slate-800/60 bg-black/50 px-4 py-3 hover:bg-black/70 transition">
                               <span className="text-sm font-semibold">
                                 Sources ({m.sources.length})
                               </span>
@@ -1355,8 +1403,8 @@ export default function Page() {
                                 const isWeb = !!s.url;
 
                                 return (
-                                  <div key={s.label} className="rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 p-3">
-                                    <div className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
+                                  <div key={s.label} className="rounded-xl border border-slate-700/50 p-3 glass-panel glass-panel--thin">
+                                    <div className="text-xs font-semibold text-slate-300/70">
                                       {s.label} {isWeb ? "· Web" : "· Local"}
                                     </div>
 
@@ -1366,20 +1414,20 @@ export default function Page() {
                                           href={s.url}
                                           target="_blank"
                                           rel="noreferrer"
-                                          className="text-sm font-medium text-cyan-600 dark:text-cyan-400 hover:underline"
+                                          className="text-sm font-medium text-sky-300 hover:underline"
                                         >
                                           {s.title || s.url}
                                         </a>
                                         {s.snippet ? (
-                                          <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
+                                          <div className="mt-1 text-sm text-slate-300/80">
                                             {s.snippet}
                                           </div>
                                         ) : null}
                                       </div>
                                     ) : (
-                                      <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
+                                      <div className="mt-1 text-sm text-slate-300/80">
                                         <div className="truncate">{s.doc_path}</div>
-                                        <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                                        <div className="text-xs text-slate-400/80">
                                           chunk {s.chunk_index} {typeof s.score === "number" ? `· score ${s.score.toFixed(3)}` : ""}
                                         </div>
                                       </div>
@@ -1401,14 +1449,14 @@ export default function Page() {
         </div>
 
         {/* input at bottom */}
-        <div className="rounded-3xl h-29 border border-slate-800/60 bg-linear-to-r from-[#0f1823] via-[#0f1f2b] to-[#0b111a] backdrop-blur-xl shadow-[0_18px_80px_rgba(0,0,0,0.45)] mt-2 mb-8 mx-auto w-full max-w-450">
+        <div className="rounded-3xl h-29 mt-2 mb-8 mx-auto w-full max-w-450 glass-panel glass-panel--input neon-edge">
           <div className="p-4">
             <textarea
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               onKeyDown={onKeyDown}
               placeholder='Ask Jarvis something, or click the microphone to speak...'
-              className="w-full min-h-5 resize-none bg-transparent text-sm leading-relaxed text-slate-100 outline-none placeholder:text-slate-500"
+              className="w-full min-h-5 resize-none bg-transparent text-sm leading-relaxed text-slate-100 outline-none placeholder:text-slate-500 font-mono"
             />
 
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1417,9 +1465,10 @@ export default function Page() {
                   <button
                     type="button"
                     onClick={() => setShowModeMenu((v) => !v)}
+                    ref={modeButtonRef}
                     className={cx(
-                      "mt-1.5 h-8 w-8 rounded-2xl text-slate-200 transition hover:border-cyan-400/60 hover:bg-cyan-500/10 active:scale-[0.97] active:translate-y-px",
-                      showModeMenu ? "border-cyan-400/70 bg-cyan-500/10" : "border-slate-800/70"
+                      "mt-1.5 h-8 w-8 rounded-2xl text-slate-200 transition hover:border-emerald-300/60 hover:bg-emerald-500/10 active:scale-[0.97] active:translate-y-px",
+                      showModeMenu ? "border-emerald-300/70 bg-emerald-500/10" : "border-slate-800/70"
                     )}
                     title="Choose mode"
                   >
@@ -1439,8 +1488,13 @@ export default function Page() {
                     </svg>
                   </button>
 
-                  {showModeMenu && (
-                    <div className="absolute bottom-full left-0 mb-3 z-20 w-60 rounded-2xl border border-slate-800/70 bg-[#0e141c] shadow-[0_20px_60px_rgba(0,0,0,0.45)]">
+                </div>
+                {showModeMenu && modeMenuPos
+                  ? createPortal(
+                    <div
+                      className="fixed z-[9999] w-60 rounded-2xl glass-panel glass-panel--menu"
+                      style={{ top: modeMenuPos.top, left: modeMenuPos.left, backgroundColor: "rgba(5,8,12,0.82)", backdropFilter: "blur(16px)" }}
+                    >
                       <div className="px-4 py-3 text-[11px] uppercase tracking-[0.35em] text-slate-400">
                         Modes
                       </div>
@@ -1455,17 +1509,17 @@ export default function Page() {
                           className={cx(
                             "flex w-full items-center justify-between px-4 py-3 text-sm font-semibold transition",
                             opt === mode
-                              ? "text-cyan-200 bg-cyan-500/10"
+                              ? "text-emerald-200 bg-emerald-500/10"
                               : "text-slate-200 hover:bg-slate-800/60"
                           )}
                         >
                           <span className="flex items-center gap-3">
-                            <span className="h-2.5 w-2.5 rounded-full bg-linear-to-r from-cyan-300 to-emerald-300 shadow-[0_0_12px_rgba(94,234,212,0.5)]" />
+                            <span className="h-2.5 w-2.5 rounded-full bg-linear-to-r from-emerald-300 to-teal-300" />
                             {modeLabels[opt]}
                           </span>
                           {opt === mode ? (
                             <svg
-                              className="h-4 w-4 text-cyan-200"
+                              className="h-4 w-4 text-emerald-200"
                               viewBox="0 0 24 24"
                               fill="none"
                               stroke="currentColor"
@@ -1479,16 +1533,17 @@ export default function Page() {
                           ) : null}
                         </button>
                       ))}
-                    </div>
-                  )}
-                </div>
+                    </div>,
+                    document.body
+                  )
+                  : null}
 
                 <div
                   className={cx(
                     "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold",
-                    mode === "general" && "border-sky-500/30 bg-sky-500/15 text-sky-100",
-                    mode === "local" && "border-emerald-500/30 bg-emerald-500/15 text-emerald-100",
-                    mode === "search" && "border-amber-400/30 bg-amber-400/15 text-amber-100"
+                    mode === "general" && "border-emerald-500/40 bg-emerald-500/15 text-emerald-100",
+                    mode === "local" && "border-teal-500/40 bg-teal-500/15 text-teal-100",
+                    mode === "search" && "border-cyan-400/40 bg-cyan-500/15 text-cyan-100"
                   )}
                 >
                   {mode === "general" && (
@@ -1550,8 +1605,8 @@ export default function Page() {
                   className={cx(
                     "h-9 w-10 rounded-2xl border text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px active:scale-[0.98]",
                     isRecording
-                      ? "border-rose-400/70 bg-rose-500/15 text-rose-100 hover:border-rose-300/70 hover:bg-rose-500/20 hover:shadow-[0_0_30px_rgba(244,63,94,0.25)]"
-                      : "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-cyan-400/60 hover:bg-cyan-500/10 hover:shadow-[0_12px_45px_rgba(34,211,238,0.18)]"
+                      ? "border-rose-400/70 bg-rose-500/15 text-rose-100 hover:border-rose-300/70 hover:bg-rose-500/20"
+                      : "border-slate-800/70 bg-black/40 text-slate-200 hover:border-emerald-300/60 hover:bg-emerald-500/10"
                   )}
                   title={isRecording ? "Stop recording" : "Start recording"}
                 >
@@ -1591,8 +1646,8 @@ export default function Page() {
                   className={cx(
                     "h-9 w-9 rounded-2xl border text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px active:scale-[0.98]",
                     ttsMuted
-                      ? "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-cyan-400/60 hover:bg-cyan-500/10"
-                      : "border-cyan-400/60 bg-cyan-500/10 text-cyan-100"
+                      ? "border-slate-800/70 bg-black/40 text-slate-200 hover:border-emerald-300/60 hover:bg-emerald-500/10"
+                      : "border-emerald-300/60 bg-emerald-500/10 text-emerald-100"
                   )}
                   title={ttsMuted ? "Unmute voice" : "Mute voice"}
                 >
@@ -1630,7 +1685,7 @@ export default function Page() {
                 {/* Clear */}
                 <button
                   onClick={clearChat}
-                  className="h-9 w-9 rounded-2xl border border-slate-800/70 bg-slate-950/40 text-slate-200 transition duration-200 hover:border-rose-400/60 hover:bg-rose-500/10 active:translate-y-px active:scale-[0.98]"
+                  className="h-9 w-9 rounded-2xl border border-slate-800/70 bg-black/40 text-slate-200 transition duration-200 hover:border-rose-400/60 hover:bg-rose-500/10 active:translate-y-px active:scale-[0.98]"
                   title="Clear chat"
                 >
                   <svg
@@ -1654,13 +1709,13 @@ export default function Page() {
                   disabled={!canAsk}
                   className={cx(
                     "w-20 mb-1 rounded-2xl px-3 py-2 text-sm font-semibold transition relative overflow-hidden active:translate-y-px active:scale-[0.99]",
-                    canAsk ? "text-white shadow-lg shadow-slate-900/40" : "bg-slate-800 text-slate-500 cursor-not-allowed"
+                    canAsk ? "text-white" : "bg-slate-800 text-slate-500 cursor-not-allowed"
                   )}
                 >
                   {canAsk && (
-                    <span className="absolute inset-0 bg-linear-to-r from-cyan-600 via-cyan-500 to-emerald-400 opacity-90" />
+                    <span className="absolute inset-0 bg-linear-to-r from-emerald-600 via-teal-500 to-cyan-400 opacity-90" />
                   )}
-                  <span className={cx("relative flex items-center justify-center gap-2", canAsk ? "drop-shadow" : "")}>
+                  <span className="relative flex items-center justify-center gap-2">
                     {loading ? (
                       <span className="inline-flex items-center gap-2">
                         <span className="h-4 w-4 animate-spin rounded-full border border-white/40 border-t-white/90" />
