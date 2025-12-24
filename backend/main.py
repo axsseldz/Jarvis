@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from index import run_index  
 from vosk import Model, KaldiRecognizer
 from dotenv import load_dotenv
+import trafilatura
 import httpx
 import faiss
 import json
@@ -41,6 +42,12 @@ CONVERSATION_LOCK = asyncio.Lock()
 CONVERSATIONS: dict[str, dict] = {}
 MAX_CONTEXT_TOKENS = 2200
 MAX_RECENT_TURNS = 3
+WEB_MAX_BYTES = 1_500_000
+WEB_FETCH_TIMEOUT = 15.0
+WEB_FETCH_CONCURRENCY = 3
+WEB_HEAD_PARAGRAPHS = 3
+WEB_MAX_PARAGRAPHS = 8
+WEB_MAX_CHARS = 2200
 
 FORMAT_RULES = (
     "FORMAT:\n"
@@ -187,6 +194,69 @@ async def brave_web_search(query: str, count: int = 5):
 
     return results
 
+async def _fetch_html(client: httpx.AsyncClient, url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; LocalAI/1.0; +https://localhost)",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    r = await client.get(url, headers=headers, follow_redirects=True)
+    r.raise_for_status()
+    content_type = (r.headers.get("content-type") or "").lower()
+    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+        return ""
+    content = r.content or b""
+    if len(content) > WEB_MAX_BYTES:
+        content = content[:WEB_MAX_BYTES]
+    try:
+        return content.decode(r.encoding or "utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+async def _build_web_context(query: str, results: list[dict]) -> tuple[list[dict], list[str]]:
+    if not results:
+        return [], []
+
+    semaphore = asyncio.Semaphore(WEB_FETCH_CONCURRENCY)
+    enriched: list[dict | None] = [None] * len(results)
+    blocks: list[str | None] = [None] * len(results)
+
+    async with httpx.AsyncClient(timeout=WEB_FETCH_TIMEOUT) as client:
+
+        async def process_result(idx: int, r: dict) -> None:
+            url = r.get("url") or ""
+            if not url:
+                return
+            async with semaphore:
+                try:
+                    html = await _fetch_html(client, url)
+                except Exception:
+                    html = ""
+            readable = _extract_readable_text(html, url)
+            paragraphs = _extract_paragraphs(readable)
+            selected = _select_relevant_paragraphs(paragraphs, query)
+            excerpt = "\n\n".join(selected).strip()
+            if not excerpt:
+                excerpt = (r.get("snippet") or "").strip()
+            if not excerpt:
+                return
+
+            title = r.get("title") or url
+            label = r.get("label") or ""
+            blocks[idx] = f"[{label}] {title}\nURL: {url}\nEXCERPT:\n{excerpt}"
+            short_snippet = excerpt.split("\n", 1)[0][:280].strip()
+            enriched[idx] = {
+                "label": label,
+                "title": title,
+                "url": url,
+                "snippet": short_snippet,
+            }
+
+        await asyncio.gather(*(process_result(i, r) for i, r in enumerate(results)))
+
+    final_enriched = [e for e in enriched if e]
+    final_blocks = [b for b in blocks if b]
+    return final_enriched, final_blocks
+
 async def ollama_stream(prompt: str, model: str):
     num_ctx = 5120 
     payload = {
@@ -320,6 +390,108 @@ async def build_local_prompt_and_sources(
         "retrieval_query": query_text,
     }, context_blocks
 
+async def _rewrite_query(question: str, model: str) -> str:
+    prompt = (
+        "Rewrite the user question into a concise retrieval query. "
+        "Keep key nouns, entities, and constraints. "
+        "Return only the rewritten query text.\n\n"
+        f"QUESTION:\n{question.strip()}"
+    )
+    try:
+        rewritten = await _ollama_generate(prompt, model)
+        return rewritten.strip() or question
+    except Exception:
+        return question
+
+async def _ollama_generate(prompt: str, model: str) -> str:
+    if not prompt:
+        return ""
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.3,
+        },
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return (data.get("response") or "").strip()
+
+def _extract_paragraphs(text: str) -> list[str]:
+    if not text:
+        return []
+    parts = re.split(r"\n{2,}", text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+def _query_keywords(query: str) -> list[str]:
+    if not query:
+        return []
+    words = re.findall(r"[a-zA-Z0-9']+", query.lower())
+    stop = {
+        "the", "and", "or", "but", "a", "an", "of", "to", "in", "for", "on", "with", "by",
+        "from", "at", "as", "is", "are", "was", "were", "be", "been", "being", "this", "that",
+        "these", "those", "it", "its", "into", "about", "over", "under", "what", "which",
+        "who", "whom", "why", "how", "when", "where", "can", "could", "should", "would",
+        "do", "does", "did", "done", "than", "then", "also", "only", "such",
+    }
+    deduped = []
+    seen = set()
+    for w in words:
+        if len(w) < 3 or w in stop:
+            continue
+        if w not in seen:
+            deduped.append(w)
+            seen.add(w)
+    return deduped
+
+def _select_relevant_paragraphs(paragraphs: list[str], query: str) -> list[str]:
+    if not paragraphs:
+        return []
+    keywords = _query_keywords(query)
+    selected: list[str] = []
+    seen = set()
+    for i, para in enumerate(paragraphs):
+        para_clean = para.strip()
+        if not para_clean:
+            continue
+        para_lower = para_clean.lower()
+        keep = i < WEB_HEAD_PARAGRAPHS
+        if not keep and keywords:
+            keep = any(k in para_lower for k in keywords)
+        if keep and para_clean not in seen:
+            selected.append(para_clean)
+            seen.add(para_clean)
+        if len(selected) >= WEB_MAX_PARAGRAPHS:
+            break
+
+    if not selected:
+        selected = paragraphs[:WEB_HEAD_PARAGRAPHS]
+
+    trimmed: list[str] = []
+    total = 0
+    for para in selected:
+        next_total = total + len(para)
+        if next_total > WEB_MAX_CHARS and trimmed:
+            break
+        trimmed.append(para)
+        total = next_total
+    return trimmed
+
+def _extract_readable_text(html: str, url: str) -> str:
+    if not html:
+        return ""
+    text = trafilatura.extract(
+        html,
+        include_comments=False,
+        include_tables=False,
+        include_links=False,
+        url=url,
+    )
+    return (text or "").strip()
+
 def _estimate_tokens(text: str) -> int:
     if not text:
         return 0
@@ -358,6 +530,14 @@ def _build_system_prompt(mode: str, task: str) -> str:
             "Do NOT cite or mention source IDs or filenames in the answer.",
             "Treat SOURCES CONTEXT as authoritative.",
         ])
+    elif mode == "search":
+        lines.extend([
+            "TASK: Answer using ONLY the WEB-RETRIEVED FACTUAL CONTEXT.",
+            "If the answer cannot be found in the web context, say 'I don't know'.",
+            "Keep it concise unless the user explicitly asks for a detailed/long answer.",
+            "Do NOT cite or mention source IDs or filenames in the answer.",
+            "Treat the web context as authoritative.",
+        ])
     else:
         lines.extend([
             "TASK: Answer using ONLY the provided SOURCES.",
@@ -380,7 +560,7 @@ def _build_memory_prompt(
     if summary:
         parts.append("SYSTEM:\nCONVERSATION CONTEXT (summary):\n" + summary.strip())
     if sources_block:
-        parts.append("SYSTEM:\nSOURCES CONTEXT:\n" + sources_block.strip())
+        parts.append("SYSTEM:\n" + sources_block.strip())
     if messages:
         rendered = _render_messages(messages)
         if rendered:
@@ -409,36 +589,6 @@ def _build_summary_prompt(summary: str, messages: list[dict]) -> str:
     if rendered:
         parts.append("MESSAGES:\n" + rendered)
     return "\n\n".join(parts).strip()
-
-async def _rewrite_query(question: str, model: str) -> str:
-    prompt = (
-        "Rewrite the user question into a concise retrieval query. "
-        "Keep key nouns, entities, and constraints. "
-        "Return only the rewritten query text.\n\n"
-        f"QUESTION:\n{question.strip()}"
-    )
-    try:
-        rewritten = await _ollama_generate(prompt, model)
-        return rewritten.strip() or question
-    except Exception:
-        return question
-
-async def _ollama_generate(prompt: str, model: str) -> str:
-    if not prompt:
-        return ""
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.3,
-        },
-    }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return (data.get("response") or "").strip()
 
 def _run_cmd(cmd: list[str], timeout: float = 1.5) -> str | None:
     try:
@@ -710,12 +860,14 @@ async def ask_stream(req: AskRequest):
                 yield "event: done\ndata: {}\n\n"
                 return
 
-            sources = results
+            sources, context_blocks = await _build_web_context(req.question, results)
+            if not context_blocks:
+                meta = {"mode": "search", "task": task, "sources": [], "model": model}
+                yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+                yield "data: Web results could not be fetched or extracted.\n\n"
+                yield "event: done\ndata: {}\n\n"
+                return
             final_mode = "search"
-            context_blocks = [
-                f"[{r['label']}] {r.get('title','')}\nURL: {r.get('url','')}\nSnippet: {r.get('snippet','')}"
-                for r in results
-            ]
 
 
         elif mode == "local":
@@ -749,7 +901,7 @@ async def ask_stream(req: AskRequest):
         system_prompt = _build_system_prompt(final_mode, task)
         sources_block = ""
         if final_mode in ("search", "local"):
-            heading = "WEB SOURCES:" if final_mode == "search" else "SOURCES:"
+            heading = "WEB-RETRIEVED FACTUAL CONTEXT:" if final_mode == "search" else "SOURCES:"
             sources_block = _format_sources_block(context_blocks, heading)
         user_payload = f"QUESTION:\n{req.question}"
 

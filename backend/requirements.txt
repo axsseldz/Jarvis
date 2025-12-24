@@ -8,3 +8,4 @@ python-multipart
 faster-whisper
 vosk
 python-dotenv
+trafilatura
