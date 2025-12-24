@@ -59,6 +59,13 @@ type MetricsResponse = {
   system?: {
     memory_used_bytes?: number | null;
     memory_total_bytes?: number | null;
+    memory_free_bytes?: number | null;
+    memory_active_bytes?: number | null;
+    memory_wired_bytes?: number | null;
+    memory_compressed_bytes?: number | null;
+    memory_inactive_bytes?: number | null;
+    memory_speculative_bytes?: number | null;
+    memory_purgeable_bytes?: number | null;
     swap_used_bytes?: number | null;
     swap_total_bytes?: number | null;
     cpu_percent?: number | null;
@@ -70,6 +77,7 @@ type MetricsResponse = {
     ttft_ms?: number | null;
     context_chars?: number | null;
     last_updated?: number | null;
+    rss_bytes?: number | null;
   };
   model?: {
     name?: string | null;
@@ -128,6 +136,7 @@ function downsampleBuffer(buffer: Float32Array, sampleRate: number, outRate = 16
 export default function Page() {
   const [question, setQuestion] = useState("");
   const [mode, setMode] = useState<Mode>("general");
+  const [model, setModel] = useState("llama3.1:8b");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -140,8 +149,10 @@ export default function Page() {
   const [micError, setMicError] = useState("");
   const [showModeMenu, setShowModeMenu] = useState(false);
   const [showDocsMenu, setShowDocsMenu] = useState(false);
+  const [showModelMenu, setShowModelMenu] = useState(false);
   const [docsMenuPos, setDocsMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [modeMenuPos, setModeMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [modelMenuPos, setModelMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
 
   const spokenRef = useRef<string>("");
@@ -153,6 +164,9 @@ export default function Page() {
   const modeButtonRef = useRef<HTMLButtonElement | null>(null);
   const modeMenuPortalRef = useRef<HTMLDivElement | null>(null);
   const docsMenuPortalRef = useRef<HTMLDivElement | null>(null);
+  const modelMenuRef = useRef<HTMLDivElement | null>(null);
+  const modelButtonRef = useRef<HTMLButtonElement | null>(null);
+  const modelMenuPortalRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -196,6 +210,31 @@ export default function Page() {
   }, [showDocsMenu]);
 
   useEffect(() => {
+    if (!showModelMenu) {
+      setModelMenuPos(null);
+      return;
+    }
+
+    const updatePos = () => {
+      const btn = modelButtonRef.current;
+      if (!btn || typeof window === "undefined") return;
+      const rect = btn.getBoundingClientRect();
+      const menuWidth = 240;
+      const left = Math.max(8, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 8));
+      const top = rect.bottom + 8;
+      setModelMenuPos({ top, left });
+    };
+
+    updatePos();
+    window.addEventListener("resize", updatePos);
+    window.addEventListener("scroll", updatePos, true);
+    return () => {
+      window.removeEventListener("resize", updatePos);
+      window.removeEventListener("scroll", updatePos, true);
+    };
+  }, [showModelMenu]);
+
+  useEffect(() => {
     if (!showModeMenu) {
       setModeMenuPos(null);
       return;
@@ -222,17 +261,19 @@ export default function Page() {
   }, [showModeMenu]);
 
   useEffect(() => {
-    if (!showModeMenu && !showDocsMenu) return;
+    if (!showModeMenu && !showDocsMenu && !showModelMenu) return;
     const onDocClick = (e: MouseEvent) => {
       const target = e.target as Node;
       const hitMode = modeMenuRef.current?.contains(target) || modeMenuPortalRef.current?.contains(target);
       const hitDocs = docsMenuRef.current?.contains(target) || docsMenuPortalRef.current?.contains(target);
+      const hitModel = modelMenuRef.current?.contains(target) || modelMenuPortalRef.current?.contains(target);
       if (!hitMode) setShowModeMenu(false);
       if (!hitDocs) setShowDocsMenu(false);
+      if (!hitModel) setShowModelMenu(false);
     };
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
-  }, [showModeMenu, showDocsMenu]);
+  }, [showModeMenu, showDocsMenu, showModelMenu]);
 
   const jarvisVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
 
@@ -544,7 +585,7 @@ export default function Page() {
           "Content-Type": "application/json",
           Accept: "text/event-stream",
         },
-        body: JSON.stringify({ question: q, mode, top_k: 10 }),
+        body: JSON.stringify({ question: q, mode, top_k: 10, model }),
       });
 
       if (!res.ok || !res.body) throw new Error(`Streaming failed: ${res.status}`);
@@ -718,6 +759,7 @@ export default function Page() {
     general: "General",
     search: "Search",
   };
+  const modelOptions = ["llama3.1:8b", "qwen2.5-coder:14b"];
   const modeIcons: Record<Mode, () => JSX.Element> = {
     general: () => (
       <svg
@@ -781,6 +823,11 @@ export default function Page() {
   const docsButtonLabel = "Documents";
   const memUsed = metrics?.system?.memory_used_bytes ?? null;
   const memTotal = metrics?.system?.memory_total_bytes ?? null;
+  const memFree = metrics?.system?.memory_free_bytes ?? null;
+  const memActive = metrics?.system?.memory_active_bytes ?? null;
+  const memWired = metrics?.system?.memory_wired_bytes ?? null;
+  const memCompressed = metrics?.system?.memory_compressed_bytes ?? null;
+  const llmRss = metrics?.llm?.rss_bytes ?? null;
   const memRatio = memUsed && memTotal ? memUsed / memTotal : null;
   const memPressure =
     memRatio == null ? "unknown" : memRatio < 0.75 ? "green" : memRatio < 0.9 ? "yellow" : "red";
@@ -791,7 +838,7 @@ export default function Page() {
   const tps = metrics?.llm?.tokens_per_second ?? null;
   const ttft = metrics?.llm?.ttft_ms ?? null;
   const contextChars = metrics?.llm?.context_chars ?? null;
-  const modelName = metrics?.model?.name ?? null;
+  const modelName = metrics?.model?.name ?? model ?? null;
   const modelQuant = metrics?.model?.quantization ?? null;
   const modelBackend = metrics?.model?.backend ?? null;
 
@@ -812,7 +859,116 @@ export default function Page() {
         <RadarBackground />
       </div>
 
-      <div className="absolute top-4 left-4 z-20" />
+      <div className="absolute top-4 left-4 z-20">
+        <div className="mt-6 relative w-60 overflow-hidden rounded-2xl glass-panel neon-edge px-3 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="relative" ref={modelMenuRef}>
+              <button
+                type="button"
+                onClick={() => setShowModelMenu((v) => !v)}
+                ref={modelButtonRef}
+                className={cx(
+                  "inline-flex items-center gap-2 rounded-lg border bg-transparent px-3 py-2 text-[12px] font-semibold text-slate-200 transition",
+                  showModelMenu
+                    ? "border-cyan-300/70 bg-cyan-500/15 text-cyan-100"
+                    : "border-slate-800/70 hover:border-cyan-300/60 hover:text-cyan-100"
+                )}
+                title="Choose model"
+              >
+                <span className="max-w-44 truncate">Model: {model}</span>
+                <svg
+                  className={cx("h-3.5 w-3.5 text-cyan-200 transition-transform", showModelMenu && "rotate-180")}
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M6 9l6 6 6-6" />
+                </svg>
+              </button>
+            </div>
+            <motion.svg
+              className="h-15 w-15 text-cyan-200/80"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 0.4, ease: "easeOut" }}
+              aria-hidden="true"
+            >
+              <motion.path
+                d="M7 7h10v10H7z"
+                strokeDasharray="40"
+                strokeDashoffset="40"
+                animate={{ strokeDashoffset: [40, 0, 40] }}
+                transition={{ duration: 3.2, repeat: Infinity, ease: "easeInOut" }}
+              />
+              <motion.path
+                d="M9 12h6"
+                strokeDasharray="12"
+                strokeDashoffset="12"
+                animate={{ strokeDashoffset: [12, 0, 12] }}
+                transition={{ duration: 2.6, repeat: Infinity, ease: "easeInOut", delay: 0.2 }}
+              />
+            </motion.svg>
+          </div>
+        </div>
+        {showModelMenu && modelMenuPos
+          ? createPortal(
+            <div
+              className="fixed z-9999 w-60 overflow-hidden rounded-xl glass-panel glass-panel--menu"
+              style={{ top: modelMenuPos.top, left: modelMenuPos.left }}
+              ref={modelMenuPortalRef}
+            >
+              <div className="px-3 py-2 text-[11px] uppercase tracking-[0.35em] text-slate-400">
+                Model
+              </div>
+              <div className="py-1">
+                {modelOptions.map((opt) => (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => {
+                      setModel(opt);
+                      setShowModelMenu(false);
+                    }}
+                    className={cx(
+                      "flex w-full items-center justify-between px-3 py-2 text-xs font-semibold transition",
+                      opt === model
+                        ? "text-cyan-100 bg-cyan-500/15"
+                        : "text-slate-200 hover:bg-slate-800/60"
+                    )}
+                  >
+                    <span className="truncate">{opt}</span>
+                    {opt === model ? (
+                      <svg
+                        className="h-3.5 w-3.5 text-cyan-200"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M5 12l4 4L19 7" />
+                      </svg>
+                    ) : null}
+                  </button>
+                ))}
+              </div>
+            </div>,
+            document.body
+          )
+          : null}
+      </div>
 
       <div className="absolute top-4 right-4 z-30 isolate">
         <div className="inline-flex flex-col items-stretch gap-2 bg-transparent">
@@ -994,7 +1150,7 @@ export default function Page() {
 
             <div className="mt-2 space-y-2 text-[11px] text-slate-300">
               <div className="flex items-center justify-between">
-                <span>Memory</span>
+                <span>RAM used</span>
                 <span className="text-slate-100">
                   {formatBytes(memUsed)} / {formatBytes(memTotal)}
                 </span>
@@ -1010,6 +1166,30 @@ export default function Page() {
                   )}
                   style={{ width: memRatio ? `${Math.round(memRatio * 100)}%` : "10%" }}
                 />
+              </div>
+
+              <div className="flex items-center justify-between">
+                <span>LLM RAM</span>
+                <span className="text-slate-100">{formatBytes(llmRss)}</span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-400">
+                <div className="flex items-center justify-between">
+                  <span>Free</span>
+                  <span className="text-slate-200">{formatBytes(memFree)}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>Active</span>
+                  <span className="text-slate-200">{formatBytes(memActive)}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>Wired</span>
+                  <span className="text-slate-200">{formatBytes(memWired)}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>Compressed</span>
+                  <span className="text-slate-200">{formatBytes(memCompressed)}</span>
+                </div>
               </div>
 
               <div className="flex items-center justify-between">

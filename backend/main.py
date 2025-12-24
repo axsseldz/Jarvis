@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from db import init_db
-from fastapi import FastAPI, HTTPException, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -29,13 +29,14 @@ DEFAULT_MODEL = "llama3.1:8b"
 DOCS_DIR = BASE_DIR / "data" / "documents"
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_INTERVAL_SECONDS = 180 
-WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small") 
 VOSK_MODEL_PATH = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 INDEX_LOCK = asyncio.Lock()
+MODEL_SWITCH_LOCK = asyncio.Lock()
 _METAL_CACHE = {"value": None, "ts": 0.0}
 _vosk_model = None
+_CURRENT_LLM_MODEL: str | None = None
 
 FORMAT_RULES = (
     "FORMAT:\n"
@@ -170,12 +171,13 @@ async def brave_web_search(query: str, count: int = 5):
     return results
 
 async def ollama_stream(prompt: str, model: str):
+    num_ctx = 5120 if model == "qwen2.5-coder:14b" else 3072
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": True, 
         "options": {
-            "num_ctx": 4096,
+            "num_ctx": num_ctx,
             "temperature": 0.6,
         },
     }
@@ -198,6 +200,34 @@ async def ollama_stream(prompt: str, model: str):
 
                 if obj.get("done"):
                     break
+
+async def _ollama_unload_model(model: str) -> None:
+    if not model:
+        return
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            r = await client.post(f"{OLLAMA_BASE_URL}/api/stop", json={"model": model})
+            if r.status_code < 400:
+                return
+        except Exception:
+            pass
+        try:
+            await client.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={"model": model, "prompt": "", "stream": False, "keep_alive": 0},
+            )
+        except Exception:
+            pass
+
+async def _switch_llm_model(next_model: str) -> None:
+    global _CURRENT_LLM_MODEL
+    if not next_model:
+        return
+    async with MODEL_SWITCH_LOCK:
+        prev = _CURRENT_LLM_MODEL
+        if prev and prev != next_model:
+            await _ollama_unload_model(prev)
+        _CURRENT_LLM_MODEL = next_model
     
 async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -> tuple[str | None, list, dict]:
     q_vec = (await embed_texts([question]))[0]
@@ -288,9 +318,18 @@ def _run_cmd(cmd: list[str], timeout: float = 1.5) -> str | None:
     except Exception:
         return None
 
-def _parse_vm_stat(out: str) -> tuple[int | None, int | None]:
+def _get_hw_memsize_bytes() -> int | None:
+    out = _run_cmd(["sysctl", "-n", "hw.memsize"], timeout=1.0)
     if not out:
-        return None, None
+        return None
+    try:
+        return int(out.strip())
+    except ValueError:
+        return None
+
+def _parse_vm_stat(out: str) -> dict:
+    if not out:
+        return {}
 
     page_size = 4096
     first_line = out.splitlines()[0] if out else ""
@@ -305,25 +344,25 @@ def _parse_vm_stat(out: str) -> tuple[int | None, int | None]:
     active = grab("Pages active")
     wired = grab("Pages wired down")
     compressed = grab("Pages occupied by compressor")
+    inactive = grab("Pages inactive")
+    speculative = grab("Pages speculative")
+    purgeable = grab("Pages purgeable")
+    free = grab("Pages free")
 
-    total_pages = sum(
-        grab(k)
-        for k in [
-            "Pages active",
-            "Pages inactive",
-            "Pages speculative",
-            "Pages throttled",
-            "Pages wired down",
-            "Pages purgeable",
-            "Pages occupied by compressor",
-            "Pages free",
-        ]
-    )
+    total_pages = active + inactive + speculative + wired + purgeable + compressed + free
     if total_pages == 0:
-        return None, None
+        return {}
 
-    used_pages = active + wired + compressed
-    return used_pages * page_size, total_pages * page_size
+    return {
+        "used_bytes": (active + wired + compressed) * page_size,
+        "free_bytes": (free + speculative) * page_size,
+        "active_bytes": active * page_size,
+        "wired_bytes": wired * page_size,
+        "compressed_bytes": compressed * page_size,
+        "inactive_bytes": inactive * page_size,
+        "speculative_bytes": speculative * page_size,
+        "purgeable_bytes": purgeable * page_size,
+    }
 
 def _parse_swap(out: str) -> tuple[int | None, int | None]:
     if not out:
@@ -340,6 +379,26 @@ def _parse_swap(out: str) -> tuple[int | None, int | None]:
     total = to_bytes(float(m_total.group(1)), m_total.group(2))
     used = to_bytes(float(m_used.group(1)), m_used.group(2))
     return used, total
+
+def _get_process_rss_bytes(names: list[str]) -> int | None:
+    out = _run_cmd(["ps", "-A", "-o", "rss=,comm="], timeout=1.5)
+    if not out:
+        return None
+    targets = {n.lower() for n in names}
+    total_kb = 0
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            rss_kb = int(parts[0])
+        except ValueError:
+            continue
+        cmd = parts[1].strip()
+        base = os.path.basename(cmd).lower()
+        if base in targets:
+            total_kb += rss_kb
+    return total_kb * 1024 if total_kb > 0 else None
 
 def _get_cpu_percent() -> float | None:
     out = _run_cmd(["ps", "-A", "-o", "%cpu="], timeout=1.0)
@@ -419,15 +478,24 @@ def load_faiss_index():
 
 @app.get("/api/metrics")
 def metrics():
-    used_bytes, total_bytes = _parse_vm_stat(_run_cmd(["vm_stat"]))
+    vm = _parse_vm_stat(_run_cmd(["vm_stat"]))
+    hw_memsize = _get_hw_memsize_bytes()
     swap_used, swap_total = _parse_swap(_run_cmd(["sysctl", "vm.swapusage"]))
     cpu_percent = _get_cpu_percent()
     metal_supported = _get_metal_status()
+    llm_rss_bytes = _get_process_rss_bytes(["ollama"])
 
     return {
         "system": {
-            "memory_used_bytes": used_bytes,
-            "memory_total_bytes": total_bytes,
+            "memory_used_bytes": vm.get("used_bytes"),
+            "memory_total_bytes": hw_memsize,
+            "memory_free_bytes": vm.get("free_bytes"),
+            "memory_active_bytes": vm.get("active_bytes"),
+            "memory_wired_bytes": vm.get("wired_bytes"),
+            "memory_compressed_bytes": vm.get("compressed_bytes"),
+            "memory_inactive_bytes": vm.get("inactive_bytes"),
+            "memory_speculative_bytes": vm.get("speculative_bytes"),
+            "memory_purgeable_bytes": vm.get("purgeable_bytes"),
             "swap_used_bytes": swap_used,
             "swap_total_bytes": swap_total,
             "cpu_percent": cpu_percent,
@@ -439,9 +507,10 @@ def metrics():
             "ttft_ms": LLM_METRICS["ttft_ms"],
             "context_chars": LLM_METRICS["context_chars"],
             "last_updated": LLM_METRICS["last_updated"],
+            "rss_bytes": llm_rss_bytes,
         },
         "model": {
-        "name": DEFAULT_MODEL,
+        "name": _CURRENT_LLM_MODEL or DEFAULT_MODEL,
         "quantization": "Q4_K_M",
         "backend": "Ollama",
     },
@@ -508,6 +577,7 @@ async def ask_stream(req: AskRequest):
     mode = (req.mode or "local").lower().strip()
 
     async def sse():
+        await _switch_llm_model(model)
         final_mode = mode
         sources = []
         retrieval = {}
