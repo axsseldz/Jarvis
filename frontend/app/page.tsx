@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AnimatePresence, motion } from "framer-motion";
 
@@ -89,49 +90,54 @@ type MetricsResponse = {
   };
 };
 
+function repairMarkdown(md: string) {
+  let s = (md || "").replace(/\r\n/g, "\n");
+
+  // 1) Fix bold/italic markers with extra spaces: ** bold ** -> **bold**
+  s = s.replace(/\*\*\s+([^*]+?)\s+\*\*/g, "**$1**");
+  s = s.replace(/_\s+([^_]+?)\s+_/g, "_$1_");
+  s = s.replace(/\*\s+([^*]+?)\s+\*/g, "*$1*");
+
+  // 2) If numbered list items are inline, force them onto new lines
+  // Example: "... processing: 1. **Input**: ... 2. **Hidden**: ..."
+  s = s.replace(/([^\n])\s+(\d+)\.\s+/g, "$1\n\n$2. ");
+
+  // 3) Same for bullet lists
+  s = s.replace(/([^\n])\s+-\s+/g, "$1\n\n- ");
+
+  // 4) Ensure headings start on a new line if they get glued
+  s = s.replace(/([^\n])\s+(#{1,3})\s+/g, "$1\n\n$2 ");
+
+  // 5) Clean up excessive blank lines
+  s = s.replace(/\n{3,}/g, "\n\n").trim();
+
+  return s;
+}
+
+function isProbablyMarkdown(text: string) {
+  // If any of these exist, we should NOT “pretty format” by rewriting spacing/newlines
+  // because it can break tables, code fences, lists, etc.
+  return (
+    text.includes("```") ||
+    /\n\s*[-*+]\s+/.test(text) ||              // lists
+    /\n\s*\d+\.\s+/.test(text) ||             // numbered lists
+    /\|\s*---\s*\|/.test(text) ||             // table separator
+    /\n\|.*\|\n\|/.test(text) ||              // table rows
+    /(^|\n)\s*#/.test(text) ||                // headings
+    /\*\*[^*]+\*\*/.test(text) ||             // bold
+    /`[^`]+`/.test(text)                      // inline code
+  );
+}
+
 function formatAssistantContent(message: ChatMessage) {
+  // Keep assistant output as-is to preserve Markdown. Only normalize newlines.
   if (message.role !== "assistant") return message.content;
 
   const text = message.content || "";
-  if (!text.trim()) return text;
+  if (!text) return "";
 
-  let formatted = text.replace(/\r\n/g, "\n");
-
-  // drop trailing {} or stray braces from LLM
-  formatted = formatted.replace(/\{?\s*\}\s*$/g, "").trim();
-
-  // remove inline citations like [S1], [W3]
-  formatted = formatted.replace(/\s*\[(S|W)\d+\]\s*/gi, " ");
-
-  // collapse spaced-out acronyms (e.g., "G P T" -> "GPT")
-  formatted = formatted.replace(/\b([A-Z](?:\s+[A-Z])+)\b/g, (m) => m.replace(/\s+/g, ""));
-
-  // collapse spaced-out numbers (e.g., "2 0 2 5" -> "2025")
-  formatted = formatted.replace(/\b(\d(?:\s+\d)+)\b/g, (m) => m.replace(/\s+/g, ""));
-
-  // fix split brand/name like "Py T orch" -> "PyTorch" (capitalized word, single capital, lower chunk)
-  formatted = formatted.replace(/\b([A-Z][a-z]+)\s+([A-Z])\s+([a-z]{2,})\b/g, (_m, a, b, c) => `${a}${b}${c}`);
-
-  formatted = formatted.replace(/\s+([.,;:!?])/g, "$1");
-  formatted = formatted.replace(/[ \t]{2,}/g, " ");
-
-  // encourage paragraph breaks after colons and before numbered items
-  formatted = formatted.replace(/:\s+(?=[A-Za-z0-9])/g, ":\n\n");
-  formatted = formatted.replace(/([.:;])\s*(\d+\.)\s+/g, "$1\n\n$2 ");
-  formatted = formatted.replace(/(\d+\.)\s+(?=\d+\.)/g, "$1\n\n");
-
-  // ensure bullets and paragraphs have breathing room
-  formatted = formatted
-    .replace(/([.:!?])\s*[-*•]\s+/g, "$1\n\n- ")
-    .replace(/\n\s*[-*•]\s+/g, "\n\n- ");
-
-  // add blank lines between sentences followed by capitalized starts to reduce wall-of-text
-  formatted = formatted.replace(/([.!?])\s+(?=[A-Z])/g, "$1\n\n");
-
-  formatted = formatted.replace(/\s*\*\*(.*?)\*\*\s*/g, (_m, inner) => ` **${(inner || "").trim()}** `);
-  formatted = formatted.replace(/\n{3,}/g, "\n\n");
-
-  return formatted.trim();
+  // Normalize CRLF and convert literal "\n" sequences if they appear.
+  return text.replace(/\r\n/g, "\n").replace(/\\n/g, "\n");
 }
 
 function cx(...classes: Array<string | false | null | undefined>) {
@@ -662,7 +668,19 @@ export default function Page() {
             );
           };
 
-          const chunk = data;
+          // Backend sends streamed text as JSON strings to preserve newlines.
+          let chunk = data;
+
+          if (eventName === "chunk" || eventName === "message") {
+            try {
+              const parsed = JSON.parse(data);
+              if (typeof parsed === "string") chunk = parsed;
+            } catch {
+              // Backward compatibility for the old format: "data: <space>chunk"
+              if (chunk.startsWith(" ")) chunk = chunk.slice(1);
+            }
+          }
+
           if (!metaApplied) metaApplied = true;
 
           // accumulate locally for TTS
@@ -724,6 +742,69 @@ export default function Page() {
       setLoading(false);
     }
   }
+
+  const mdComponents: Components = {
+    p: ({ children }) => <p className="my-3 leading-relaxed text-slate-100/95">{children}</p>,
+    ul: ({ children }) => <ul className="my-3 list-disc pl-6 space-y-1">{children}</ul>,
+    ol: ({ children }) => <ol className="my-3 list-decimal pl-6 space-y-1">{children}</ol>,
+    li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+    blockquote: ({ children }) => (
+      <blockquote className="my-4 border-l-2 border-slate-700/60 pl-4 text-slate-200/90">
+        {children}
+      </blockquote>
+    ),
+    h1: ({ children }) => <h1 className="mt-5 mb-2 text-xl font-semibold">{children}</h1>,
+    h2: ({ children }) => <h2 className="mt-5 mb-2 text-lg font-semibold">{children}</h2>,
+    h3: ({ children }) => <h3 className="mt-4 mb-2 text-base font-semibold">{children}</h3>,
+    a: ({ href, children }) => (
+      <a
+        href={href || "#"}
+        target="_blank"
+        rel="noreferrer"
+        className="text-cyan-300 hover:text-cyan-200 underline underline-offset-4"
+      >
+        {children}
+      </a>
+    ),
+    table: ({ children }) => (
+      <div className="my-4 w-full overflow-x-auto">
+        <table className="w-full border-collapse text-sm">{children}</table>
+      </div>
+    ),
+    thead: ({ children }) => <thead className="bg-slate-900/60">{children}</thead>,
+    th: ({ children }) => (
+      <th className="border border-slate-800/70 px-3 py-2 text-left font-semibold text-slate-100">
+        {children}
+      </th>
+    ),
+    td: ({ children }) => (
+      <td className="border border-slate-800/70 px-3 py-2 text-slate-200/90">{children}</td>
+    ),
+    code: ({ className, children, ...props }) => {
+      const isBlock = typeof className === "string" && className.length > 0; // fenced code usually has a class like language-*
+      if (!isBlock) {
+        return (
+          <code
+            className="rounded-md border border-slate-800/70 bg-slate-950/60 px-1.5 py-0.5 text-[0.9em] text-slate-100"
+            {...props}
+          >
+            {children}
+          </code>
+        );
+      }
+      return (
+        <code className={className} {...props}>
+          {children}
+        </code>
+      );
+    },
+    pre: ({ children }) => (
+      <pre className="my-4 overflow-x-auto rounded-2xl border border-slate-800/70 bg-[#0b111a] p-4 text-sm leading-relaxed text-slate-100 shadow-[0_12px_40px_rgba(0,0,0,0.35)]">
+        {children}
+      </pre>
+    ),
+  };
+
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     // Enter sends; Shift+Enter newline
@@ -1193,8 +1274,62 @@ export default function Page() {
                             </span>
                           </div>
                         ) : (
-                          <div className="prose prose-invert max-w-none leading-relaxed prose-p:my-3 prose-li:my-1">
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatted}</ReactMarkdown>
+                          <div className="max-w-none text-[15px] leading-relaxed text-slate-100/95">
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm]}
+                              components={{
+                                table({ children, ...props }) {
+                                  return (
+                                    <div className="my-4 w-full overflow-x-auto rounded-xl border border-white/10">
+                                      <table className="w-full border-collapse text-sm" {...props}>
+                                        {children}
+                                      </table>
+                                    </div>
+                                  );
+                                },
+                                thead({ children, ...props }) {
+                                  return (
+                                    <thead className="bg-white/5" {...props}>
+                                      {children}
+                                    </thead>
+                                  );
+                                },
+                                th({ children, ...props }) {
+                                  return (
+                                    <th className="px-3 py-2 text-left font-semibold border-b border-white/10" {...props}>
+                                      {children}
+                                    </th>
+                                  );
+                                },
+                                td({ children, ...props }) {
+                                  return (
+                                    <td className="px-3 py-2 align-top border-b border-white/5" {...props}>
+                                      {children}
+                                    </td>
+                                  );
+                                },
+                                code({ className, children, ...props }) {
+                                  const isBlock = typeof className === "string" && className.includes("language-");
+                                  if (!isBlock) {
+                                    return (
+                                      <code className="rounded-md bg-white/5 px-1.5 py-0.5 text-[0.95em]" {...props}>
+                                        {children}
+                                      </code>
+                                    );
+                                  }
+                                  return (
+                                    <pre className="my-4 overflow-x-auto rounded-xl bg-black/40 p-4 text-sm border border-white/10">
+                                      <code className={className} {...props}>
+                                        {children}
+                                      </code>
+                                    </pre>
+                                  );
+                                },
+                              }}
+                            >
+                              {formatted}
+                            </ReactMarkdown>
+
                           </div>
                         )
                       ) : (

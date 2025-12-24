@@ -33,6 +33,19 @@ _WHISPER_MODEL = None  # lazy-loaded singleton
 VOSK_MODEL_PATH = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
 _vosk_model = None
 
+FORMAT_RULES = (
+    "FORMAT:\n"
+    "- Output MUST be valid GitHub-Flavored Markdown.\n"
+    "- Use blank lines between paragraphs.\n"
+    "- Lists must be real markdown lists (start lines with '-' or '1.').\n"
+    "- Code must be fenced with triple backticks and a language when possible.\n"
+    "- Tables MUST be real markdown tables:\n"
+    "  * each row on its own line\n"
+    "  * header separator row like: |---|---|\n"
+    "  * NEVER output a table inline on one long line.\n"
+    "- Do not output stray asterisks. Bold must be exactly **like this**.\n"
+)
+
 BASE_DIR = Path(__file__).resolve().parents[1]  # local-ai/
 load_dotenv(BASE_DIR / ".env")
 
@@ -464,6 +477,7 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
         f"QUESTION:\n{question}\n\n"
         "SOURCES:\n" + "\n\n".join(context_blocks) + "\n\n"
         f"{instructions}"
+        f"{FORMAT_RULES}\n"
     )
 
     best = float(scores[0]) if scores else 0.0
@@ -644,11 +658,11 @@ async def ask(req: AskRequest):
     # ---------- GENERAL MODE ----------
     async def run_general() -> dict:
         prompt = (
-            "You are a helpful, conversational AI assistant.\n"
-            "Be clear, natural, and concise.\n"
-            "Only provide long explanations if the user explicitly asks.\n"
-            "If something is ambiguous, ask a clarifying question.\n\n"
-            f"User question:\n{req.question}\n"
+            "You are a helpful assistant.\n"
+            "Keep answers short by default; only go long if the user explicitly asks.\n"
+            "Do NOT invent sources.\n\n"
+            f"{FORMAT_RULES}\n"
+            f"QUESTION:\n{req.question}\n"
         )
         try:
             answer = await ollama_generate(prompt, model)
@@ -819,12 +833,12 @@ async def ask_stream(req: AskRequest):
         retrieval = {}
         if mode == "general":
             prompt = (
-            "You are a helpful, conversational AI assistant.\n"
-            "Be clear, natural, and concise.\n"
-            "Only provide long explanations if the user explicitly asks.\n"
-            "If something is ambiguous, ask a clarifying question.\n\n"
-            f"User question:\n{req.question}\n"
-        )
+                "You are a helpful assistant.\n"
+                "Keep answers short by default; only go long if the user explicitly asks.\n"
+                "Do NOT invent sources.\n\n"
+                f"{FORMAT_RULES}\n"
+                f"QUESTION:\n{req.question}\n"
+            )
 
         elif mode == "search":
             try:
@@ -885,12 +899,13 @@ async def ask_stream(req: AskRequest):
                 if first_chunk_time is None and chunk.strip():
                     first_chunk_time = time.time()
                 token_count += len(chunk.split())
-                # SSE message
-                yield f"data: {chunk}\n\n"
+
+                # Send chunks as JSON strings so newlines/special chars survive SSE framing.
+                yield f"event: chunk\ndata: {json.dumps(chunk)}\n\n"
         except httpx.ConnectError:
-            yield f"data: Cannot connect to Ollama. Is `ollama serve` running?\n\n"
+            yield f"event: chunk\ndata: {json.dumps('Cannot connect to Ollama. Is `ollama serve` running?')}\n\n"
         except Exception as e:
-            yield f"data: Error: {str(e)}\n\n"
+            yield f"event: chunk\ndata: {json.dumps('Error: ' + str(e))}\n\n"
         finally:
             if first_chunk_time:
                 elapsed = max(0.001, time.time() - first_chunk_time)
