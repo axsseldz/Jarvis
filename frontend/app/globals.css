@@ -370,3 +370,96 @@ body {
   background: radial-gradient(circle at 60% 60%, rgba(60, 220, 198, 0.8), rgba(32, 194, 170, 0.6), rgba(20, 130, 120, 0.55));
   animation: orbFlowB 12s ease-in-out infinite;
 }
+
+/* ---------------------- */
+/*  CYBER RADAR BACKGROUND  */
+/* ---------------------- */
+
+.radar-container {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* slower rings */
+.radar-ping {
+  position: absolute;
+  border: 1px solid rgba(80, 200, 220, 0.35);
+  border-radius: 9999px;
+  transform: translate(-50%, -50%);
+  left: 50%;
+  top: 40%;
+  width: 80vmin;
+  height: 80vmin;
+  animation: radarPing 10s linear infinite;
+  /* was 5s */
+  opacity: 0.5;
+  filter: drop-shadow(0 0 12px rgba(80, 200, 220, 0.35));
+}
+
+.radar-ping:nth-child(2) {
+  animation-delay: 2.5s;
+  /* was 1.2s */
+  opacity: 0.35;
+}
+
+.radar-ping:nth-child(3) {
+  animation-delay: 5s;
+  /* was 2.4s */
+  opacity: 0.25;
+}
+
+@keyframes radarPing {
+  0% {
+    transform: translate(-50%, -50%) scale(0.25);
+    opacity: 0.75;
+  }
+
+  70% {
+    opacity: 0.18;
+  }
+
+  100% {
+    transform: translate(-50%, -50%) scale(1.6);
+    opacity: 0;
+  }
+}
+
+/* ---------------------- */
+/*  RADAR SIGNAL BLIPS    */
+/* ---------------------- */
+
+.radar-blip {
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  background: rgba(80, 220, 200, 0.9);
+  border-radius: 9999px;
+  transform: translate(-50%, -50%);
+  filter: drop-shadow(0 0 7px rgba(80, 220, 200, 0.75));
+  animation: blipFlash 1.6s ease-out forwards;
+}
+
+@keyframes blipFlash {
+  0% {
+    transform: translate(-50%, -50%) scale(0.5);
+    opacity: 0;
+  }
+
+  25% {
+    opacity: 0.95;
+    transform: translate(-50%, -50%) scale(1.18);
+  }
+
+  55% {
+    opacity: 0.55;
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.85);
+  }
+}

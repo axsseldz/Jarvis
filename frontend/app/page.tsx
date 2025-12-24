@@ -6,6 +6,7 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AnimatePresence, motion } from "framer-motion";
+import RadarBackground from "@/components/RadarBackground";
 
 type Mode = "local" | "general" | "search";
 
@@ -961,6 +962,7 @@ export default function Page() {
         <div className="absolute inset-0 opacity-[0.1] bg-[radial-gradient(circle_at_20%_15%,rgba(45,212,191,0.2),transparent_30%),radial-gradient(circle_at_85%_10%,rgba(32,194,170,0.2),transparent_28%),radial-gradient(circle_at_40%_78%,rgba(20,130,120,0.2),transparent_30%)]" />
         <div className="absolute inset-0 opacity-[0.06] scan-grid" />
         <div className="absolute inset-0 scanlines" />
+        <RadarBackground />
       </div>
 
       <div className="absolute top-4 left-4 z-20" />
