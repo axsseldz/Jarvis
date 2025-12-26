@@ -32,6 +32,16 @@ type ChatMessage = {
   isLoading?: boolean;
 };
 
+type SummaryItem = {
+  id: string;
+  title: string;
+  preview: string;
+  content: string;
+  createdAt: number;
+  isLoading?: boolean;
+  error?: string;
+};
+
 type IndexStatus = {
   state: "idle" | "running" | "ok" | "error";
   is_indexing: boolean;
@@ -107,7 +117,7 @@ function uid(prefix = "m") {
 function renderPromptPreview(text: string) {
   const tokens = text.split(/(\s+)/);
   return tokens.map((token, idx) => {
-    if (token === "/agent") {
+    if (token === "/summary") {
       return (
         <span
           key={`cmd_${idx}`}
@@ -121,8 +131,56 @@ function renderPromptPreview(text: string) {
   });
 }
 
+function buildSummaryPreview(text: string) {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "Generating summary...";
+  return cleaned.length > 140 ? `${cleaned.slice(0, 140)}...` : cleaned;
+}
+
+function buildConversationTranscript(messages: ChatMessage[]) {
+  return messages
+    .map((m) => {
+      const role = m.role === "user" ? "User" : "Assistant";
+      return `${role}:\n${m.content}`;
+    })
+    .join("\n\n");
+}
+
+function buildSummaryPrompt(transcript: string, focus: string) {
+  const focusLine = focus ? `Focus: ${focus}\n` : "";
+  return [
+    "You are preparing a highly detailed conversation summary.",
+    "Include concrete decisions, key ideas, and any code snippets in fenced blocks.",
+    "Use clear markdown sections and bullet lists where helpful.",
+    "Do not mention that you are an AI or that you summarized.",
+    "",
+    focusLine,
+    "Conversation:",
+    transcript,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function extractSummaryTitle(text: string) {
+  const match = text.match(/^Title:\s*(.+)$/m);
+  if (!match) return "";
+  return match[1].trim();
+}
+
+function stripSummaryTitle(text: string) {
+  return text.replace(/^Title:.*\n?/m, "").trimStart();
+}
+
+function stripLeadingMeta(text: string) {
+  return text
+    .replace(/^\s*\{[\s\S]*?\}\s*/m, "")
+    .replace(/^#\s*Conversation Summary.*\n?/i, "")
+    .replace(/^\s*Conversation Summary:.*\n?/i, "");
+}
+
 function enforceSingleAgentCommand(input: string) {
-  const pattern = /(^|\s)\/agent(?=\s|$)/g;
+  const pattern = /(^|\s)\/summary(?=\s|$)/g;
   const matches = [...input.matchAll(pattern)];
   if (matches.length <= 1) return input;
   let kept = 0;
@@ -131,7 +189,7 @@ function enforceSingleAgentCommand(input: string) {
       kept += 1;
       return match;
     }
-    return match.replace("/agent", "").replace(/\s{2,}/g, " ");
+    return match.replace("/summary", "").replace(/\s{2,}/g, " ");
   });
 }
 
@@ -186,6 +244,8 @@ export default function Page() {
   const [modelMenuPos, setModelMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [summaries, setSummaries] = useState<SummaryItem[]>([]);
+  const [selectedSummaryId, setSelectedSummaryId] = useState<string | null>(null);
 
   const spokenRef = useRef<string>("");
   const finalTranscriptRef = useRef<string>("");
@@ -587,6 +647,14 @@ export default function Page() {
     const q = text.trim();
     if (!q || loading) return;
 
+    const agentPattern = /(^|\s)\/summary(?=\s|$)/;
+    if (agentPattern.test(q)) {
+      const titleSeed = q.replace(agentPattern, " ").replace(/\s+/g, " ").trim();
+      setQuestion("");
+      await createConversationSummary(titleSeed);
+      return;
+    }
+
     setLoading(true);
     setError("");
 
@@ -757,7 +825,7 @@ export default function Page() {
     const raw = e.currentTarget.value;
     const cursor = e.currentTarget.selectionStart ?? raw.length;
     const sanitized = enforceSingleAgentCommand(raw);
-    const shouldPad = cursor === sanitized.length && /(^|\s)\/agent$/.test(sanitized);
+    const shouldPad = cursor === sanitized.length && /(^|\s)\/summary$/.test(sanitized);
     if (shouldPad) {
       const padded = `${sanitized} `;
       setQuestion(padded);
@@ -779,6 +847,125 @@ export default function Page() {
         }
       });
     }
+  }
+
+  function formatSummaryStamp(ts: number) {
+    const date = new Date(ts);
+    const day = date.toLocaleDateString([], { month: "short", day: "2-digit" });
+    const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return `${day} · ${time}`;
+  }
+
+  async function streamSummary(prompt: string, summaryId: string) {
+    try {
+      const res = await fetch("http://localhost:8000/ask/stream", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({
+          question: prompt,
+          mode,
+          top_k: 10,
+          model,
+          conversation_id: conversationIdRef.current,
+        }),
+      });
+
+      if (!res.ok || !res.body) throw new Error(`Streaming failed: ${res.status}`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() || "";
+
+        for (const frame of frames) {
+          const lines = frame.split("\n").filter(Boolean);
+          let eventName = "message";
+          const dataLines: string[] = [];
+
+          for (const line of lines) {
+            if (line.startsWith("event:")) eventName = line.slice("event:".length).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice("data:".length));
+          }
+
+          const data = dataLines.join("\n");
+
+          if (eventName === "done") {
+            setSummaries((prev) =>
+              prev.map((s) => (s.id === summaryId ? { ...s, isLoading: false } : s))
+            );
+            continue;
+          }
+
+          let chunk = data;
+          if (eventName === "meta") continue;
+          if (eventName === "chunk" || eventName === "message") {
+            try {
+              const parsed = JSON.parse(data);
+              if (typeof parsed === "string") chunk = parsed;
+              else if (parsed && typeof parsed.content === "string") chunk = parsed.content;
+              else chunk = "";
+            } catch {
+              if (chunk.startsWith(" ")) chunk = chunk.slice(1);
+            }
+          }
+
+          setSummaries((prev) =>
+            prev.map((s) => {
+              if (s.id !== summaryId) return s;
+              const nextContent = `${s.content}${chunk}`;
+              const cleaned = stripLeadingMeta(nextContent);
+              const nextTitle = s.title === "Generating title..." ? extractSummaryTitle(cleaned) : "";
+              const displayContent = stripSummaryTitle(cleaned);
+              return {
+                ...s,
+                content: cleaned,
+                title: nextTitle ? nextTitle : s.title,
+                preview: buildSummaryPreview(displayContent),
+              };
+            })
+          );
+        }
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Summary failed";
+      setSummaries((prev) =>
+        prev.map((s) => (s.id === summaryId ? { ...s, isLoading: false, error: message } : s))
+      );
+    }
+  }
+
+  async function createConversationSummary(titleSeed: string) {
+    const transcript = buildConversationTranscript(messages);
+    const summaryId = uid("s");
+    const title = titleSeed || "Conversation Summary";
+    const next: SummaryItem = {
+      id: summaryId,
+      title,
+      preview: "Generating summary...",
+      content: "",
+      createdAt: Date.now(),
+      isLoading: true,
+    };
+
+    setSummaries((prev) => [next, ...prev]);
+    setIsSidebarOpen(true);
+
+    const prompt = buildSummaryPrompt(
+      transcript || "No prior conversation yet.",
+      titleSeed
+    );
+    await streamSummary(prompt, summaryId);
   }
 
   function clearChat() {
@@ -905,6 +1092,8 @@ export default function Page() {
   const modelName = metrics?.model?.name ?? model ?? null;
   const modelQuant = metrics?.model?.quantization ?? null;
   const modelBackend = metrics?.model?.backend ?? null;
+  const selectedSummary = summaries.find((s) => s.id === selectedSummaryId) || null;
+  const sortedSummaries = [...summaries].sort((a, b) => b.createdAt - a.createdAt);
 
   return (
     <div
@@ -936,7 +1125,7 @@ export default function Page() {
               aria-hidden="true"
             />
             <motion.aside
-              className="fixed left-0 top-0 z-40 h-full w-70 max-w-[80vw] overflow-y-auto border-0 bg-slate-950/90 px-5 pb-6 pt-5 shadow-[0_0_40px_rgba(12,255,220,0.08)] glass-panel glass-panel--input"
+              className="fixed left-0 top-0 z-40 h-full w-96 max-w-[90vw] overflow-y-auto border-0 bg-slate-950/90 px-6 pb-6 pt-5 shadow-[0_0_40px_rgba(12,255,220,0.08)] glass-panel glass-panel--input"
               initial={{ x: "-100%" }}
               animate={{ x: 0 }}
               exit={{ x: "-100%" }}
@@ -946,7 +1135,7 @@ export default function Page() {
             >
               <div className="flex items-center justify-between">
                 <div className="text-xs uppercase tracking-[0.4em] text-slate-400">
-                  Navigation
+                  Summaries
                 </div>
                 <button
                   type="button"
@@ -968,14 +1157,151 @@ export default function Page() {
                   </svg>
                 </button>
               </div>
-              <div className="mt-6 space-y-3 text-sm text-slate-300">
-                <div className="rounded-xl border-0 bg-cyan-500/10 px-4 py-3">
-                  Add your sidebar content here.
+              <div className="mt-6 flex h-[calc(100%-3.5rem)] gap-4 text-sm text-slate-300">
+                <div className="flex w-full flex-col gap-3">
+                  <div className="flex-1 space-y-3 overflow-y-auto pr-1">
+                    {summaries.length === 0 ? (
+                      <div className="rounded-2xl border border-slate-800/60 bg-slate-950/40 px-4 py-4 text-xs text-slate-400">
+                        No summaries yet. Type /summary to create one.
+                      </div>
+                    ) : (
+                      sortedSummaries.map((s) => (
+                        <button
+                          key={s.id}
+                          type="button"
+                          onClick={() =>
+                            setSelectedSummaryId((prev) => (prev === s.id ? null : s.id))
+                          }
+                          className={cx(
+                            "w-full rounded-2xl border px-4 py-3 text-left transition",
+                            selectedSummaryId === s.id
+                              ? "border-slate-700/70 bg-slate-950/60 text-slate-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]"
+                              : "border-slate-800/60 bg-slate-950/30 text-slate-300 hover:bg-slate-950/60"
+                          )}
+                        >
+                          <div className="text-[10px] uppercase tracking-[0.28em] text-slate-400">
+                            {formatSummaryStamp(s.createdAt)}
+                          </div>
+                          <div className="mt-1 text-sm font-semibold text-slate-100 truncate">
+                            {s.title}
+                          </div>
+                        </button>
+                      ))
+                    )}
+                  </div>
                 </div>
+
+                <div className="flex min-w-0 flex-1 flex-col" />
               </div>
             </motion.aside>
           </>
         )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {isSidebarOpen && selectedSummary ? (
+          <motion.section
+            className="fixed left-1/2 top-6 z-40 h-[calc(100%-3rem)] w-[min(860px,calc(100vw-4rem))] -translate-x-1/2 rounded-3xl border border-slate-800/60 bg-slate-950/85 p-5 shadow-[0_0_40px_rgba(12,255,220,0.08)] glass-panel glass-panel--input"
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 12 }}
+            transition={{ duration: 0.2 }}
+            role="dialog"
+            aria-label="Summary detail"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="mt-1 text-sm font-semibold text-slate-100">
+                  {selectedSummary.title}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedSummaryId(null)}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800/60 text-slate-300 transition hover:text-slate-100"
+                title="Close summary"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  className="h-4 w-4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M6 6l12 12" />
+                  <path d="M18 6l-12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="mt-4 h-[calc(100%-3.5rem)] overflow-y-auto rounded-2xl border border-slate-800/50 bg-black/30 p-4">
+              {selectedSummary.error ? (
+                <div className="text-xs text-rose-300">{selectedSummary.error}</div>
+              ) : selectedSummary.isLoading && !selectedSummary.content ? (
+                <div className="text-xs text-slate-400">Generating summary...</div>
+              ) : (
+                <div className="text-[14px] leading-relaxed text-slate-100/90">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      table({ children, ...props }) {
+                        return (
+                          <div className="my-4 w-full overflow-x-auto rounded-xl border border-white/10">
+                            <table className="w-full border-collapse text-sm" {...props}>
+                              {children}
+                            </table>
+                          </div>
+                        );
+                      },
+                      thead({ children, ...props }) {
+                        return (
+                          <thead className="bg-white/5" {...props}>
+                            {children}
+                          </thead>
+                        );
+                      },
+                      th({ children, ...props }) {
+                        return (
+                          <th className="px-3 py-2 text-left font-semibold border-b border-white/10" {...props}>
+                            {children}
+                          </th>
+                        );
+                      },
+                      td({ children, ...props }) {
+                        return (
+                          <td className="px-3 py-2 align-top border-b border-white/5" {...props}>
+                            {children}
+                          </td>
+                        );
+                      },
+                      code({ className, children, ...props }) {
+                        const isBlock = typeof className === "string" && className.includes("language-");
+                        if (!isBlock) {
+                          return (
+                            <code className="rounded-md bg-white/5 px-1.5 py-0.5 text-[0.95em] font-mono" {...props}>
+                              {children}
+                            </code>
+                          );
+                        }
+                        return (
+                          <pre className="my-3 overflow-x-auto rounded-xl border border-white/10 bg-black/50 p-3 text-xs font-mono">
+                            <code className={className} {...props}>
+                              {children}
+                            </code>
+                          </pre>
+                        );
+                      },
+                    }}
+                  >
+                    {stripSummaryTitle(selectedSummary.content)}
+                  </ReactMarkdown>
+                </div>
+              )}
+            </div>
+          </motion.section>
+        ) : null}
       </AnimatePresence>
 
       <div className="absolute top-4 left-4 z-20">
