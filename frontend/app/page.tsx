@@ -856,6 +856,11 @@ export default function Page() {
     return `${day} · ${time}`;
   }
 
+  function deleteSummary(id: string) {
+    setSummaries((prev) => prev.filter((s) => s.id !== id));
+    setSelectedSummaryId((prev) => (prev === id ? null : prev));
+  }
+
   async function streamSummary(prompt: string, summaryId: string) {
     try {
       const res = await fetch("http://localhost:8000/ask/stream", {
@@ -1187,26 +1192,57 @@ export default function Page() {
                       </div>
                     ) : (
                       sortedSummaries.map((s) => (
-                        <button
+                        <div
                           key={s.id}
-                          type="button"
                           onClick={() =>
                             setSelectedSummaryId((prev) => (prev === s.id ? null : s.id))
                           }
                           className={cx(
-                            "w-full rounded-2xl border px-4 py-3 text-left transition",
+                            "group relative w-full rounded-2xl border px-4 py-3 text-left transition",
                             selectedSummaryId === s.id
                               ? "border-slate-700/70 bg-slate-950/60 text-slate-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]"
                               : "border-slate-800/60 bg-slate-950/30 text-slate-300 hover:bg-slate-950/60"
                           )}
+                          role="button"
+                          tabIndex={0}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              setSelectedSummaryId((prev) => (prev === s.id ? null : s.id));
+                            }
+                          }}
                         >
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              deleteSummary(s.id);
+                            }}
+                            className="absolute right-3 top-3 inline-flex h-6 w-6 items-center justify-center rounded-md border border-slate-800/60 text-slate-400 opacity-0 transition group-hover:opacity-100 hover:text-slate-200"
+                            title="Delete summary"
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              className="h-3.5 w-3.5"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path d="M3 6h18" />
+                              <path d="M8 6V4h8v2" />
+                              <path d="M6 6l1 14h10l1-14" />
+                            </svg>
+                          </button>
                           <div className="text-[10px] uppercase tracking-[0.28em] text-slate-400">
                             {formatSummaryStamp(s.createdAt)}
                           </div>
                           <div className="mt-1 text-sm font-semibold text-slate-100 truncate">
                             {s.title}
                           </div>
-                        </button>
+                        </div>
                       ))
                     )}
                   </div>
@@ -1236,25 +1272,48 @@ export default function Page() {
                   {selectedSummary.title}
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setSelectedSummaryId(null)}
-                className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800/60 text-slate-300 transition hover:text-slate-100"
-                title="Close summary"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  className="h-4 w-4"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.8"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => deleteSummary(selectedSummary.id)}
+                  className="inline-flex h-8 items-center gap-2 rounded-lg border border-slate-800/60 px-3 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-300 transition hover:text-slate-100"
+                  title="Delete summary"
                 >
-                  <path d="M6 6l12 12" />
-                  <path d="M18 6l-12 12" />
-                </svg>
-              </button>
+                  <svg
+                    viewBox="0 0 24 24"
+                    className="h-4 w-4"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M3 6h18" />
+                    <path d="M8 6V4h8v2" />
+                    <path d="M6 6l1 14h10l1-14" />
+                  </svg>
+                  Delete
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedSummaryId(null)}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800/60 text-slate-300 transition hover:text-slate-100"
+                  title="Close summary"
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    className="h-4 w-4"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M6 6l12 12" />
+                    <path d="M18 6l-12 12" />
+                  </svg>
+                </button>
+              </div>
             </div>
 
             <div className="mt-4 h-[calc(100%-3.5rem)] overflow-y-auto rounded-2xl border border-slate-800/50 bg-black/30 p-4">
