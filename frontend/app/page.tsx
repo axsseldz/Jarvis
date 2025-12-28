@@ -1186,7 +1186,7 @@ export default function Page() {
               aria-hidden="true"
             />
             <motion.aside
-              className="fixed left-0 top-0 z-40 h-full w-96 max-w-[90vw] overflow-y-auto border-0 bg-slate-950/90 px-6 pb-6 pt-5 shadow-[0_0_40px_rgba(12,255,220,0.08)] glass-panel glass-panel--input"
+              className="fixed left-0 top-0 z-40 h-full w-96 max-w-[90vw] overflow-y-auto bg-transparent px-6 pb-6 pt-5"
               initial={{ x: "-100%" }}
               animate={{ x: 0 }}
               exit={{ x: "-100%" }}
@@ -1198,31 +1198,12 @@ export default function Page() {
                 <div className="text-xs uppercase tracking-[0.4em] text-slate-400">
                   Summaries
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setIsSidebarOpen(false)}
-                  className="inline-flex h-9 w-9 items-center justify-center rounded-lg border-0 text-cyan-100 transition hover:text-cyan-50"
-                  aria-label="Close sidebar"
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    className="h-4 w-4"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <path d="M6 6l12 12" />
-                    <path d="M18 6l-12 12" />
-                  </svg>
-                </button>
               </div>
               <div className="mt-6 flex h-[calc(100%-3.5rem)] gap-4 text-sm text-slate-300">
                 <div className="flex w-full flex-col gap-3">
                   <div className="flex-1 space-y-3 overflow-y-auto pr-1">
                     {summaries.length === 0 ? (
-                      <div className="rounded-2xl border border-slate-800/60 bg-slate-950/40 px-4 py-4 text-xs text-slate-400">
+                      <div className="rounded-2xl glass-panel glass-panel--input px-4 py-4 text-xs text-slate-400">
                         No summaries yet. Type /summary to create one.
                       </div>
                     ) : (
@@ -1233,10 +1214,7 @@ export default function Page() {
                             setSelectedSummaryId((prev) => (prev === s.id ? null : s.id))
                           }
                           className={cx(
-                            "group relative w-full rounded-2xl border px-4 py-3 text-left transition",
-                            selectedSummaryId === s.id
-                              ? "border-slate-700/70 bg-slate-950/60 text-slate-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]"
-                              : "border-slate-800/60 bg-slate-950/30 text-slate-300 hover:bg-slate-950/60"
+                            "group relative w-full rounded-2xl border px-4 py-3 text-left transition glass-panel glass-panel--input"
                           )}
                           role="button"
                           tabIndex={0}
@@ -1293,7 +1271,7 @@ export default function Page() {
       <AnimatePresence>
         {isSidebarOpen && selectedSummary ? (
           <motion.section
-            className="fixed left-1/2 top-6 z-40 h-[calc(100%-3rem)] w-[min(860px,calc(100vw-4rem))] -translate-x-1/2 rounded-3xl border border-slate-800/60 bg-slate-950/85 p-5 shadow-[0_0_40px_rgba(12,255,220,0.08)] glass-panel glass-panel--input"
+            className="fixed top-6 right-6 left-6 lg:left-100 z-40 h-[calc(100%-3rem)] rounded-3xl border border-slate-800/60 bg-slate-950/85 p-5 shadow-[0_0_40px_rgba(12,255,220,0.08)] glass-panel glass-panel--input"
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 12 }}
@@ -1420,18 +1398,16 @@ export default function Page() {
       </AnimatePresence>
 
       <div className="absolute top-4 left-4 z-20">
- <div className="mt-6 flex items-center gap-3">
+      <div className="mt-6 flex items-center gap-3">
           <button
             type="button"
             onClick={() => setIsSidebarOpen(true)}
-            className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border-0 text-cyan-100 shadow-[0_0_18px_rgba(45,212,191,0.2)] transition hover:bg-cyan-500/10 glass-panel glass-panel--input"
+            className="inline-flex h-11 w-11 mb-1 items-center justify-center rounded-2xl border-0"
             aria-label="Open sidebar"
           >
-
             <svg
-
               viewBox="0 0 24 24"
-              className="h-5 w-5"
+              className="h-7 w-7"
               fill="none"
               stroke="currentColor"
               strokeWidth="1.8"
@@ -1439,7 +1415,7 @@ export default function Page() {
               strokeLinejoin="round"
 
             >
-   <path d="M4 6h16" />
+              <path d="M4 6h16" />
               <path d="M4 12h16" />
               <path d="M4 18h16" />
             </svg>
@@ -1476,12 +1452,12 @@ export default function Page() {
         {showModelMenu && modelMenuPos
           ? createPortal(
             <div
-              className="fixed z-9999 w-60 overflow-hidden rounded-xl glass-panel glass-panel--menu"
+              className="fixed z-9999 w-60 overflow-hidde rounded-xl glass-panel glass-panel--menu"
               style={{ top: modelMenuPos.top, left: modelMenuPos.left }}
               ref={modelMenuPortalRef}
             >
               <div className="px-3 py-2 text-[11px] uppercase tracking-[0.35em] text-slate-400">
-                Model
+                Models
               </div>
               <div className="py-1">
                 {modelOptions.map((opt) => (
@@ -1523,7 +1499,7 @@ export default function Page() {
           : null}
       </div>
           
-      <div className="absolute top-4 right-4 z-30 isolate">
+      <div className="absolute top-4 right-4 z-10 isolate">
         <div className="inline-flex flex-col items-stretch gap-2 bg-transparent">
           <div className="mt-6 inline-flex items-center gap-2 rounded-2xl px-2.5 py-1.5 text-[11px] text-slate-300 glass-panel glass-panel--thin neon-edge">
             {/* Docs dropdown */}
